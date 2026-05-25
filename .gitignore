@@ -1,0 +1,53 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_modules/
+
+# Next.js build output
+.next/
+out/
+build/
+dist/
+
+# Vercel local state
+.vercel/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Databases and Scraping temporary files
+*.db
+*.db-shm
+*.db-wal
+*.log
+temp_sao/
+temp_downloads/
+vault/meetings/
+
+# Environment files and credentials
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+*.pem
+*.key
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Old temporary repositories folder
+temp_repos/

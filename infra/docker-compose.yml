@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:16-pgdg
+    container_name: penner_postgres_db
+    restart: always
+    environment:
+      POSTGRES_DB: penner_governance_db
+      POSTGRES_USER: penner_admin
+      POSTGRES_PASSWORD: penner_secret_password_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U penner_admin -d penner_governance_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../
+      dockerfile: services/backend/Dockerfile
+    container_name: penner_backend_service
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://penner_admin:penner_secret_password_2026@db:5432/penner_governance_db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MEMBRANE_API_KEY=${MEMBRANE_API_KEY}
+    ports:
+      - "8002:8002"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../
+      dockerfile: apps/frontend/Dockerfile
+    container_name: penner_frontend_app
+    restart: always
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8002
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
