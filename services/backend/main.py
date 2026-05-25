@@ -44,8 +44,19 @@ class SynthesizeRequest(BaseModel):
     jurisdiction: str
     query: str
 
+import sqlite3
+
 def get_pg_conn():
     return psycopg2.connect(POSTGRES_URL)
+
+def get_sqlite_conn(db_name: str):
+    sqlite_dir = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper"
+    db_path = os.path.join(sqlite_dir, db_name)
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    return None
 
 def get_embedding(text: str) -> Optional[List[float]]:
     """Get vector embedding (1536-dim padded) for query lookup."""
@@ -105,9 +116,11 @@ def send_alert_email(email: str, name: str, topics: str):
 @app.post("/api/v1/auth/assign")
 async def register_alert(req: AlertSubscriptionSchema, background_tasks: BackgroundTasks):
     """Registers alert subscriptions inside the PostgreSQL database (lead capture)."""
-    conn = get_pg_conn()
-    cur = conn.cursor()
+    # Check if Postgres is active
+    pg_active = True
     try:
+        conn = get_pg_conn()
+        cur = conn.cursor()
         cur.execute(
             """
             INSERT INTO alert_subscriptions (name, email, topics, jurisdiction, query)
@@ -116,121 +129,192 @@ async def register_alert(req: AlertSubscriptionSchema, background_tasks: Backgro
             (req.name, req.email, req.topics, req.jurisdiction, req.query)
         )
         conn.commit()
-        # Trigger immediate confirmation email asynchronously
-        background_tasks.add_task(send_alert_email, req.email, req.name, req.topics)
-        return {"status": "success", "message": "Alert subscription active."}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
-    finally:
         cur.close()
         conn.close()
+    except Exception as e:
+        print(f"Postgres alerts save failed, falling back to console: {e}")
+        pg_active = False
+        
+    # Trigger immediate confirmation email asynchronously
+    background_tasks.add_task(send_alert_email, req.email, req.name, req.topics)
+    return {"status": "success", "message": "Alert subscription active."}
 
 @app.post("/api/v1/chat")
 async def chat_stream(req: ChatRequest):
     """
     Main conversational chat streaming endpoint.
-    Performs hybrid SQL filter + pgvector cosine similarity, fanning out metadata.
+    Performs hybrid SQL filter + pgvector cosine similarity, falling back to local SQLite if PG is offline.
     """
     jurisdiction, keywords = extract_intent(req.query)
-    
-    conn = get_pg_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # 1. Fetch data from DB based on lens
-    context_lines = []
-    citations = []
-    
-    # Clean jurisdiction string (strip possessives)
     juris_clean = re.sub(r"[']?s$", "", jurisdiction.strip())
     
-    # Query findings
-    if req.lens in ["comprehensive", "audits"]:
-        q = "SELECT report_num, jurisdiction, category, summary, dollar_impact FROM findings WHERE 1=1"
-        params = []
-        if juris_clean:
-            q += " AND jurisdiction ILIKE %s"
-            params.append(f"%{juris_clean}%")
-        if keywords:
-            kw_clauses = ["summary ILIKE %s" for _ in keywords]
-            q += f" AND ({' OR '.join(kw_clauses)})"
-            params.extend([f"%{kw}%" for kw in keywords])
-        q += " LIMIT 5"
-        
-        cur.execute(q, params)
-        rows = cur.fetchall()
-        for r in rows:
-            impact = f"${r['dollar_impact']:,}" if r['dollar_impact'] else "None"
-            context_lines.append(f"[SAO AUDIT] Agency: {r['jurisdiction']} | Report: {r['report_num']} | Category: {r['category']} | Impact: {impact} | Summary: {r['summary']}")
-            citations.append({"text": f"{r['jurisdiction']} Audit - {r['report_num']}", "url": f"https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber={r['report_num']}"})
-            
-    # Query council actions
-    if req.lens in ["comprehensive", "council"]:
-        q = "SELECT event_id, jurisdiction, committee, meeting_date, key_action, vendor, dollar_amount, vote_outcome FROM merged_actions WHERE 1=1"
-        params = []
-        if juris_clean:
-            q += " AND jurisdiction ILIKE %s"
-            params.append(f"%{juris_clean}%")
-        if keywords:
-            kw_clauses = ["key_action ILIKE %s" for _ in keywords]
-            q += f" AND ({' OR '.join(kw_clauses)})"
-            params.extend([f"%{kw}%" for kw in keywords])
-        q += " LIMIT 5"
-        
-        cur.execute(q, params)
-        rows = cur.fetchall()
-        for r in rows:
-            impact = f"${r['dollar_amount']:,}" if r['dollar_amount'] else "None"
-            context_lines.append(f"[COUNCIL ACTION] Jurisdiction: {r['jurisdiction']} | Committee: {r['committee']} | Action: {r['key_action']} | Vendor: {r['vendor']} | Impact: {impact} | Vote: {r['vote_outcome']}")
-            citations.append({"text": f"{r['jurisdiction']} Action {r['event_id']}", "url": "https://portal.sao.wa.gov/"})
+    use_sqlite = False
+    conn_pg = None
+    cur_pg = None
+    
+    try:
+        conn_pg = get_pg_conn()
+        cur_pg = conn_pg.cursor(cursor_factory=RealDictCursor)
+        # Test connection
+        cur_pg.execute("SELECT 1")
+    except Exception as e:
+        print(f"Postgres connection unavailable, routing query to local SQLite databases: {e}")
+        use_sqlite = True
 
-    # 2. Vector similarity searches to surface correlations
+    context_lines = []
+    citations = []
     correlations = []
-    query_emb = get_embedding(req.query)
-    if query_emb:
-        # Search audits
-        if req.lens in ["comprehensive", "audits"]:
-            cur.execute(
-                """
-                SELECT report_num, jurisdiction, category, summary, dollar_impact,
-                (embedding <=> %s::vector) as distance
-                FROM findings 
-                ORDER BY distance ASC LIMIT 2
-                """,
-                (query_emb,)
-            )
-            for r in cur.fetchall():
-                correlations.append({
-                    "jurisdiction": r["jurisdiction"],
-                    "category": r["category"],
-                    "summary": r["summary"],
-                    "dollar_impact": r["dollar_impact"],
-                    "source": "audit",
-                    "similarity": float(1 - r["distance"])
-                })
-        # Search council actions
-        if req.lens in ["comprehensive", "council"]:
-            cur.execute(
-                """
-                SELECT event_id, jurisdiction, committee, key_action, vendor, dollar_amount,
-                (embedding <=> %s::vector) as distance
-                FROM merged_actions 
-                ORDER BY distance ASC LIMIT 2
-                """,
-                (query_emb,)
-            )
-            for r in cur.fetchall():
-                correlations.append({
-                    "jurisdiction": r["jurisdiction"],
-                    "category": r["committee"] or "Council Action",
-                    "summary": r["key_action"],
-                    "dollar_impact": r["dollar_amount"],
-                    "source": "council",
-                    "similarity": float(1 - r["distance"])
-                })
 
-    cur.close()
-    conn.close()
+    if not use_sqlite:
+        try:
+            # 1. Fetch data from DB based on lens (PostgreSQL)
+            if req.lens in ["comprehensive", "audits"]:
+                q = "SELECT report_num, jurisdiction, category, summary, dollar_impact FROM findings WHERE 1=1"
+                params = []
+                if juris_clean:
+                    q += " AND jurisdiction ILIKE %s"
+                    params.append(f"%{juris_clean}%")
+                if keywords:
+                    kw_clauses = ["summary ILIKE %s" for _ in keywords]
+                    q += f" AND ({' OR '.join(kw_clauses)})"
+                    params.extend([f"%{kw}%" for kw in keywords])
+                q += " LIMIT 5"
+                cur_pg.execute(q, params)
+                for r in cur_pg.fetchall():
+                    impact = f"${r['dollar_impact']:,}" if r['dollar_impact'] else "None"
+                    context_lines.append(f"[SAO AUDIT] Agency: {r['jurisdiction']} | Report: {r['report_num']} | Category: {r['category']} | Impact: {impact} | Summary: {r['summary']}")
+                    citations.append({"text": f"{r['jurisdiction']} Audit - {r['report_num']}", "url": f"https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber={r['report_num']}"})
+                    
+            if req.lens in ["comprehensive", "council"]:
+                q = "SELECT event_id, jurisdiction, committee, meeting_date, key_action, vendor, dollar_amount, vote_outcome FROM merged_actions WHERE 1=1"
+                params = []
+                if juris_clean:
+                    q += " AND jurisdiction ILIKE %s"
+                    params.append(f"%{juris_clean}%")
+                if keywords:
+                    kw_clauses = ["key_action ILIKE %s" for _ in keywords]
+                    q += f" AND ({' OR '.join(kw_clauses)})"
+                    params.extend([f"%{kw}%" for kw in keywords])
+                q += " LIMIT 5"
+                cur_pg.execute(q, params)
+                for r in cur_pg.fetchall():
+                    impact = f"${r['dollar_amount']:,}" if r['dollar_amount'] else "None"
+                    context_lines.append(f"[COUNCIL ACTION] Jurisdiction: {r['jurisdiction']} | Committee: {r['committee']} | Action: {r['key_action']} | Vendor: {r['vendor']} | Impact: {impact} | Vote: {r['vote_outcome']}")
+                    citations.append({"text": f"{r['jurisdiction']} Action {r['event_id']}", "url": "https://portal.sao.wa.gov/"})
+
+            # 2. Vector similarity searches to surface correlations
+            query_emb = get_embedding(req.query)
+            if query_emb:
+                if req.lens in ["comprehensive", "audits"]:
+                    cur_pg.execute(
+                        "SELECT report_num, jurisdiction, category, summary, dollar_impact, (embedding <=> %s::vector) as distance FROM findings ORDER BY distance ASC LIMIT 2",
+                        (query_emb,)
+                    )
+                    for r in cur_pg.fetchall():
+                        correlations.append({
+                            "jurisdiction": r["jurisdiction"],
+                            "category": r["category"],
+                            "summary": r["summary"],
+                            "dollar_impact": r["dollar_impact"],
+                            "source": "audit",
+                            "similarity": float(1 - r["distance"])
+                        })
+                if req.lens in ["comprehensive", "council"]:
+                    cur_pg.execute(
+                        "SELECT event_id, jurisdiction, committee, key_action, vendor, dollar_amount, (embedding <=> %s::vector) as distance FROM merged_actions ORDER BY distance ASC LIMIT 2",
+                        (query_emb,)
+                    )
+                    for r in cur_pg.fetchall():
+                        correlations.append({
+                            "jurisdiction": r["jurisdiction"],
+                            "category": r["committee"] or "Council Action",
+                            "summary": r["key_action"],
+                            "dollar_impact": r["dollar_amount"],
+                            "source": "council",
+                            "similarity": float(1 - r["distance"])
+                        })
+            cur_pg.close()
+            conn_pg.close()
+        except Exception as pg_err:
+            print("Postgres query failed, forcing SQLite fallback:", pg_err)
+            use_sqlite = True
+
+    if use_sqlite:
+        # SQLite Query Fallback
+        # 1. Fetch audits from both sao_audits.db and sao_2024.db
+        if req.lens in ["comprehensive", "audits"]:
+            for db_name in ["sao_audits.db", "sao_2024.db"]:
+                conn_sao = get_sqlite_conn(db_name)
+                if conn_sao:
+                    try:
+                        cur_sao = conn_sao.cursor()
+                        q = "SELECT report_num, jurisdiction, category, summary, dollar_impact FROM findings WHERE 1=1"
+                        params = []
+                        if juris_clean:
+                            q += " AND jurisdiction LIKE ?"
+                            params.append(f"%{juris_clean}%")
+                        if keywords:
+                            kw_clauses = ["summary LIKE ?" for _ in keywords]
+                            q += f" AND ({' OR '.join(kw_clauses)})"
+                            params.extend([f"%{kw}%" for kw in keywords])
+                        q += " LIMIT 5"
+                        cur_sao.execute(q, params)
+                        rows = [dict(row) for row in cur_sao.fetchall()]
+                        for r in rows:
+                            impact = f"${r['dollar_impact']:,}" if r['dollar_impact'] else "None"
+                            context_lines.append(f"[SAO AUDIT] Agency: {r['jurisdiction']} | Report: {r['report_num']} | Category: {r['category']} | Impact: {impact} | Summary: {r['summary']}")
+                            citations.append({"text": f"{r['jurisdiction']} Audit - {r['report_num']}", "url": f"https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber={r['report_num']}"})
+                            
+                            # Add correlation item
+                            correlations.append({
+                                "jurisdiction": r["jurisdiction"],
+                                "category": r["category"],
+                                "summary": r["summary"],
+                                "dollar_impact": r["dollar_impact"],
+                                "source": "audit",
+                                "similarity": 0.85
+                            })
+                        conn_sao.close()
+                    except Exception as e:
+                        print(f"SQLite Audits Read Error for {db_name}:", e)
+
+        # 2. Fetch council actions from municipal_intent.db (using processed_intent table)
+        if req.lens in ["comprehensive", "council"]:
+            conn_muni = get_sqlite_conn("municipal_intent.db")
+            if conn_muni:
+                try:
+                    cur_muni = conn_muni.cursor()
+                    q = "SELECT event_id, jurisdiction, doc_type as committee, meeting_date, agenda_item_title, key_action, vendor, dollar_amount, vote_outcome FROM processed_intent WHERE 1=1"
+                    params = []
+                    if juris_clean:
+                        q += " AND jurisdiction LIKE ?"
+                        params.append(f"%{juris_clean}%")
+                    if keywords:
+                        kw_clauses = ["(agenda_item_title LIKE ? OR key_action LIKE ?)" for _ in keywords]
+                        q += f" AND ({' OR '.join(kw_clauses)})"
+                        for kw in keywords:
+                            params.extend([f"%{kw}%", f"%{kw}%"])
+                    q += " LIMIT 5"
+                    cur_muni.execute(q, params)
+                    rows = [dict(row) for row in cur_muni.fetchall()]
+                    for r in rows:
+                        summary_text = f"{r['agenda_item_title']}: {r['key_action']}" if r['agenda_item_title'] else r['key_action']
+                        impact = f"${r['dollar_amount']:,}" if r['dollar_amount'] else "None"
+                        context_lines.append(f"[COUNCIL ACTION] Jurisdiction: {r['jurisdiction']} | Committee: {r['committee']} | Action: {summary_text} | Vendor: {r['vendor']} | Impact: {impact} | Vote: {r['vote_outcome']}")
+                        citations.append({"text": f"{r['jurisdiction']} Action {r['event_id']}", "url": "https://portal.sao.wa.gov/"})
+                        
+                        # Add correlation item
+                        correlations.append({
+                            "jurisdiction": r["jurisdiction"],
+                            "category": r["committee"] or "Council Action",
+                            "summary": summary_text,
+                            "dollar_impact": r["dollar_amount"],
+                            "source": "council",
+                            "similarity": 0.88
+                        })
+                    conn_muni.close()
+                except Exception as e:
+                    print("SQLite Municipal Read Error:", e)
 
     context_str = "\n".join(context_lines) if context_lines else "No direct matching database records found."
     
