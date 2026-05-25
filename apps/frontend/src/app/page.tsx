@@ -578,7 +578,7 @@ export default function Dashboard() {
                   <button onClick={() => handleSuggestionClick("Tacoma police department budget changes")} className="px-3.5 py-2 bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl text-xs font-semibold tracking-wide border border-white/5 hover:border-white/10 transition-all cursor-pointer">
                     Tacoma Police Budgets
                   </button>
-                  <button onClick={() => handleSuggestionClick("Who is Transpo Group USA in contracts?") className="px-3.5 py-2 bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl text-xs font-semibold tracking-wide border border-white/5 hover:border-white/10 transition-all cursor-pointer">
+                  <button onClick={() => handleSuggestionClick("Who is Transpo Group USA in contracts?")} className="px-3.5 py-2 bg-white/5 hover:bg-white/10 text-slate-300 rounded-xl text-xs font-semibold tracking-wide border border-white/5 hover:border-white/10 transition-all cursor-pointer">
                     Transpo Group Contracts
                   </button>
                 </div>
