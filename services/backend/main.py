@@ -322,14 +322,12 @@ async def chat_stream(req: ChatRequest):
     system_prompt = f"""You are the PennerAI Civic Intelligence Agent. 
 You provide deep, fact-based answers exploring Washington State policies and local governance.
 Format your answer strictly in 2-3 readable paragraphs using markdown.
-Rely strictly on the provided context. If no records exist, answer dynamically but state that data records are empty.
 
 CONTEXT DATABASE RECORDS:
 {context_str}
 """
 
     async def event_generator():
-        # Call the Membrane client chat completions
         # Default follow up suggestions
         suggestions = [
             f"Show other findings for {jurisdiction}" if jurisdiction else "Are there similar audit findings?",
@@ -337,48 +335,143 @@ CONTEXT DATABASE RECORDS:
             "How did city council vote on this?"
         ]
         
-        try:
-            stream = membrane.chat_completion(
-                model="membrane-engagement-layer",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": req.query}
-                ],
-                stream=True
-            )
+        if not GEMINI_API_KEY:
+            # Fallback to Membrane client completions if key is missing
+            try:
+                stream = membrane.chat_completion(
+                    model="membrane-engagement-layer",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": req.query}
+                    ],
+                    stream=True
+                )
+                
+                for line in stream:
+                    if line.startswith("data: "):
+                        content = line[6:].strip()
+                        if content == "[DONE]":
+                            continue
+                        try:
+                            parsed = json.loads(content)
+                            token = ""
+                            if "choices" in parsed:
+                                token = parsed["choices"][0]["delta"].get("content", "")
+                            elif "chunk" in parsed:
+                                token = parsed["chunk"]
+                            
+                            if token:
+                                yield f"data: {json.dumps({'chunk': token})}\n\n"
+                        except:
+                            pass
+                
+            except Exception as e:
+                yield f"data: {json.dumps({'chunk': f'Error rendering narrative: {e}'})}\n\n"
+        else:
+            # Main path: Direct Gemini 3.5 Flash call with live Google Search Grounding
+            import requests
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?key={GEMINI_API_KEY}"
+            headers = {"Content-Type": "application/json"}
             
-            for line in stream:
-                # Membrane streams standard SSE lines like 'data: {"choices": [{"delta": {"content": "..."}}]}'
-                # Or local proxy streams simpler formats. We handle both.
-                if line.startswith("data: "):
-                    content = line[6:].strip()
-                    if content == "[DONE]":
-                        continue
-                    try:
-                        parsed = json.loads(content)
-                        # Yield token content if present
-                        token = ""
-                        if "choices" in parsed:
-                            token = parsed["choices"][0]["delta"].get("content", "")
-                        elif "chunk" in parsed:
-                            token = parsed["chunk"]
-                        
-                        if token:
-                            yield f"data: {json.dumps({'chunk': token})}\n\n"
-                    except:
-                        pass
-                        
-            # Yield metadata event right before completion
-            metadata_event = {
-                "citations": citations[:4],
-                "suggestions": suggestions,
-                "correlations": correlations
+            prompt = f"""You are the PennerAI Civic Intelligence Agent.
+Answer the user's question about Washington State local governance.
+Rely on the provided CONTEXT DATABASE RECORDS for any specific local audits or council actions.
+If the CONTEXT DATABASE RECORDS do not contain enough information to fully answer the user's question, use your search grounding tool to search the web for the latest factual information about Washington State cities, councils, and state laws.
+State clearly which parts of your answer come from our verified audit/council database and which parts are from public search grounding.
+Be factual, cite your sources, and do not hallucinate.
+
+User Question: {req.query}
+"""
+            
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"googleSearch": {}}],
+                "generationConfig": {
+                    "temperature": 0.2
+                },
+                "systemInstruction": {
+                    "parts": [{"text": system_prompt}]
+                }
             }
-            yield f"data: {json.dumps(metadata_event)}\n\n"
             
-        except Exception as e:
-            yield f"data: {json.dumps({'chunk': f'Error rendering narrative: {e}'})}\n\n"
-            
+            try:
+                res = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+                res.raise_for_status()
+                
+                buffer = ""
+                for chunk in res.iter_content(chunk_size=1024, decode_unicode=True):
+                    if chunk:
+                        buffer += chunk
+                        while True:
+                            start_idx = buffer.find("{")
+                            if start_idx == -1:
+                                break
+                            
+                            brace_count = 0
+                            in_string = False
+                            escape = False
+                            end_idx = -1
+                            
+                            for idx in range(start_idx, len(buffer)):
+                                char = buffer[idx]
+                                if char == '"' and not escape:
+                                    in_string = not in_string
+                                elif char == '\\' and in_string:
+                                    escape = not escape
+                                    continue
+                                elif not in_string:
+                                    if char == '{':
+                                        brace_count += 1
+                                    elif char == '}':
+                                        brace_count -= 1
+                                        if brace_count == 0:
+                                            end_idx = idx
+                                            break
+                                escape = False
+                                
+                            if end_idx != -1:
+                                obj_str = buffer[start_idx:end_idx+1]
+                                buffer = buffer[end_idx+1:]
+                                try:
+                                    parsed = json.loads(obj_str)
+                                    candidate = parsed["candidates"][0]
+                                    
+                                    # Yield text token
+                                    text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+                                    if text:
+                                        yield f"data: {json.dumps({'chunk': text})}\n\n"
+                                        
+                                    # Extract grounding chunks (sources) if present
+                                    metadata = candidate.get("groundingMetadata", {})
+                                    if "groundingChunks" in metadata:
+                                        for web_chunk in metadata["groundingChunks"]:
+                                            if "web" in web_chunk:
+                                                uri = web_chunk["web"].get("uri", "")
+                                                title = web_chunk["web"].get("title", "")
+                                                if uri and title:
+                                                    # Deduplicate and add to citations list
+                                                    if not any(c["url"] == uri for c in citations):
+                                                        citations.append({"text": title, "url": uri})
+                                except Exception as e:
+                                    pass
+                            else:
+                                break
+                                
+            except Exception as e:
+                yield f"data: {json.dumps({'chunk': f'Error contacting Gemini Grounded API: {e}'})}\n\n"
+                
+        # Unified citations merging logic (limit 4 DB findings and 6 web search sources)
+        db_cits = [c for c in citations if "portal.sao.wa.gov" in c["url"]]
+        web_cits = [c for c in citations if c not in db_cits]
+        final_citations = db_cits[:4] + web_cits[:6]
+        
+        # Yield metadata event right before completion
+        metadata_event = {
+            "citations": final_citations,
+            "suggestions": suggestions,
+            "correlations": correlations
+        }
+        yield f"data: {json.dumps(metadata_event)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
