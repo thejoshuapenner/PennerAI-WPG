@@ -1772,6 +1772,27 @@ def calculate_text_similarity(query: str, doc_text: str) -> float:
         
     return round(0.50 + 0.48 * overlap_ratio, 2)
 
+def truncate_suggestion(s: str, max_len: int = 120) -> str:
+    """Truncates a suggestion to max_len, ensuring it does not cut off mid-word."""
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    
+    # Try to find a space within the last few characters before max_len
+    truncated = s[:max_len]
+    last_space = truncated.rfind(' ')
+    
+    # If we found a space and it's not too far back (within 15 chars)
+    if last_space != -1 and max_len - last_space < 15:
+        truncated = truncated[:last_space]
+    
+    # Strip any trailing punctuation and add '...' (or '...?' if it was a question)
+    truncated = truncated.rstrip('.,:;!? ')
+    if s.endswith('?'):
+        return truncated + '...?'
+    else:
+        return truncated + '...'
+
 def generate_heuristic_suggestions(query: str, jurisdiction: Optional[str], context_lines: list) -> list:
     """Generates 3 contextual, relevant follow-up questions based on query search terms and jurisdiction."""
     suggestions = []
@@ -1787,7 +1808,8 @@ def generate_heuristic_suggestions(query: str, jurisdiction: Optional[str], cont
         "total", "amount", "dollar", "dollars", "much", "did", "its", "our", "their", 
         "they", "them", "he", "she", "it", "on", "about", "for", "do", "does", "did",
         "have", "has", "had", "get", "got", "make", "made", "go", "went", "take",
-        "took", "find", "found", "show", "showing", "list", "view", "details"
+        "took", "find", "found", "show", "showing", "list", "view", "details",
+        "analyze", "correlation", "report", "explain", "significance", "draft"
     }
     
     juris_words = set(re.findall(r'\b\w+\b', jurisdiction.lower())) if jurisdiction else set()
@@ -1799,52 +1821,77 @@ def generate_heuristic_suggestions(query: str, jurisdiction: Optional[str], cont
     quotes = re.findall(r'"([^"]+)"|\'([^\']+)\'', query)
     quoted_terms = [q[0] or q[1] for q in quotes if q[0] or q[1]]
     
-    # Filter quoted terms to exclude jurisdiction words as well
-    clean_quoted_terms = []
-    for q in quoted_terms:
-        q_words = re.findall(r'\b\w+\b', q.lower())
-        if not any(qw in juris_words for qw in q_words):
-            clean_quoted_terms.append(q)
+    # Prevent discarding quoted terms that contain jurisdiction words
+    clean_quoted_terms = list(quoted_terms)
             
     entity = clean_quoted_terms[0] if clean_quoted_terms else (" ".join(key_terms[:3]) if key_terms else "")
+    entity_title = entity.title().strip()
     
     entity_lower = entity.lower()
     is_school = "school" in entity_lower or "district" in entity_lower or "sd" in entity_lower or "schools" in entity_lower
     
-    if jurisdiction:
-        juris_title = jurisdiction.title()
-        if entity and is_school:
-            suggestions.append(f"Show other findings for {entity.title()}")
-        else:
+    topic_keywords = {
+        "weakness", "weaknesses", "finding", "findings", "control", "controls", 
+        "deficit", "deficits", "vote", "votes", "contract", "contracts", 
+        "financial", "violation", "violations", "report", "reports", "audit", 
+        "audits", "expenditure", "expenditures", "revenue", "revenues", 
+        "budget", "budgets", "loan", "loans", "debt", "debts", "failure", 
+        "failures", "fraud", "misappropriation", "spending", "spend", "cost", 
+        "costs", "pay", "payment", "payments", "funding", "fund", "funds",
+        "tax", "taxes", "rate", "rates", "audit", "auditing", "unqualified", 
+        "opinion", "opinions", "compliance", "noncompliance", "internal",
+        "material", "significant", "deficiency", "deficiencies", "allowable"
+    }
+    
+    entity_words = [w.lower() for w in re.findall(r'\b\w+\b', entity)]
+    is_topic = (
+        len(entity_words) > 4 
+        or any(w in topic_keywords for w in entity_words)
+    )
+    
+    if is_topic:
+        if jurisdiction:
+            juris_title = jurisdiction.title()
+            suggestions.append(f"Are there other similar findings in {juris_title}?")
+            suggestions.append(f"How did {juris_title} respond to this audit finding?")
             suggestions.append(f"Show other findings for {juris_title}")
-        if entity:
-            entity_title = entity.title()
-            if is_school:
-                suggestions.append(f"Are there other {entity_title} audit findings?")
-                suggestions.append(f"What was the total enrollment for {entity_title}?")
-            else:
-                suggestions.append(f"Are there other {entity_title} contracts in {juris_title}?")
-                suggestions.append(f"What was {juris_title}'s total spend on {entity_title}?")
         else:
-            suggestions.append(f"What was the total budget impact for {juris_title}?")
-            suggestions.append(f"How did {juris_title} city council vote recently?")
+            suggestions.append("Which jurisdictions have similar audit findings?")
+            suggestions.append("What is the typical corrective action for this finding?")
+            suggestions.append("Are there other recent findings about this topic?")
     else:
-        if entity:
-            entity_title = entity.title()
-            if is_school:
-                suggestions.append(f"Which school districts have similar audit findings?")
-                suggestions.append(f"What is the average spending for {entity_title}?")
-                suggestions.append(f"Are there federal funding issues involving {entity_title}?")
+        if jurisdiction:
+            juris_title = jurisdiction.title()
+            if entity_title and is_school:
+                suggestions.append(f"Show other findings for {entity_title}")
             else:
-                suggestions.append(f"Which cities contracted with {entity_title}?")
-                suggestions.append(f"What is the total spending on {entity_title}?")
-                suggestions.append(f"Are there audit findings involving {entity_title}?")
+                suggestions.append(f"Show other findings for {juris_title}")
+            if entity_title:
+                if is_school:
+                    suggestions.append(f"Are there other {entity_title} audit findings?")
+                    suggestions.append(f"What was the total enrollment for {entity_title}?")
+                else:
+                    suggestions.append(f"Are there other {entity_title} contracts in {juris_title}?")
+                    suggestions.append(f"What was {juris_title}'s total spend on {entity_title}?")
+            else:
+                suggestions.append(f"What was the total budget impact for {juris_title}?")
+                suggestions.append(f"How did {juris_title} city council vote recently?")
         else:
-            suggestions.append("Are there similar audit findings?")
-            suggestions.append("What was the total dollar impact?")
-            suggestions.append("How did city council vote on this?")
+            if entity_title:
+                if is_school:
+                    suggestions.append(f"Which school districts have similar audit findings?")
+                    suggestions.append(f"What is the average spending for {entity_title}?")
+                    suggestions.append(f"Are there federal funding issues involving {entity_title}?")
+                else:
+                    suggestions.append(f"Which cities contracted with {entity_title}?")
+                    suggestions.append(f"What is the total spending on {entity_title}?")
+                    suggestions.append(f"Are there audit findings involving {entity_title}?")
+            else:
+                suggestions.append("Are there similar audit findings?")
+                suggestions.append("What was the total dollar impact?")
+                suggestions.append("How did city council vote on this?")
             
-    return [s[:80] for s in suggestions[:3]]
+    return [truncate_suggestion(s, 120) for s in suggestions[:3]]
 
 def fetch_context_and_correlations(lens: str, jurisdiction: str, keywords: List[str], query_emb: Optional[List[float]], use_sqlite: bool, query_text: str = "") -> tuple[List[str], List[dict], List[dict]]:
     """Runs database queries (structured and vector) in a single synchronous thread pool context."""
@@ -1862,7 +1909,8 @@ def fetch_context_and_correlations(lens: str, jurisdiction: str, keywords: List[
         "meeting", "meetings", "minutes", "report", "reports", "city", 
         "county", "council", "municipal", "governance", "policy", 
         "record", "records", "file", "files", "document", "documents",
-        "tell", "show", "me", "about", "what", "how", "who", "which", "where"
+        "tell", "show", "me", "about", "what", "how", "who", "which", "where",
+        "analyze", "correlation", "explain", "significance", "draft"
     }
     
     juris_words = set(re.findall(r'\b\w+\b', jurisdiction.lower())) if jurisdiction else set()
@@ -2476,7 +2524,8 @@ async def register_alert(req: AlertSubscriptionSchema, background_tasks: Backgro
     
     # Log usage event for this request
     response_time = int((time.time() - start_time) * 1000)
-    log_usage_event(
+    await asyncio.to_thread(
+        log_usage_event,
         ip_address=client_ip,
         anonymous_user_id=anon_user_id,
         session_id=session_id,
@@ -2532,7 +2581,7 @@ async def chat_stream(
                 
         if not is_dev_key:
             # Check rate limit (15 requests/day default, 50 for alerts subscribed users)
-            if not check_rate_limit(client_ip, anon_user_id):
+            if not await asyncio.to_thread(check_rate_limit, client_ip, anon_user_id):
                 raise HTTPException(
                     status_code=429, 
                     detail="Daily message limit reached. Please register for alerts or upgrade your account to continue."
@@ -2540,6 +2589,44 @@ async def chat_stream(
         
         # 3. Run original dashboard streaming flow
         return await original_chat_stream_flow(query, lens, api_key, request, history)
+
+def insert_inline_citations(narrative: str, grounding_metadata: dict) -> str:
+    """Inserts inline citations (e.g., [1], [2]) into the narrative text based on Gemini grounding metadata."""
+    if not grounding_metadata:
+        return narrative
+        
+    supports = grounding_metadata.get("groundingSupports", [])
+    if not supports:
+        return narrative
+        
+    # Map segment text to referenced chunk indices (1-based)
+    segments_to_indices = []
+    for s in supports:
+        seg_text = s.get("segment", {}).get("text", "").strip()
+        chunk_indices = s.get("groundingChunkIndices", [])
+        if seg_text and chunk_indices:
+            segments_to_indices.append((seg_text, [idx + 1 for idx in chunk_indices]))
+            
+    # Sort by length descending to match longer segments first (prevents sub-string replacement issues)
+    segments_to_indices.sort(key=lambda x: len(x[0]), reverse=True)
+    
+    processed_narrative = narrative
+    for seg_text, cite_nums in segments_to_indices:
+        cite_str = "".join([f" [{num}]" for num in cite_nums])
+        
+        idx = processed_narrative.find(seg_text)
+        if idx != -1:
+            end_pos = idx + len(seg_text)
+            # Check if citation bracket is already present right after the segment
+            following_text = processed_narrative[end_pos:end_pos + 15]
+            if not any(f"[{num}]" in following_text for num in cite_nums):
+                processed_narrative = (
+                    processed_narrative[:end_pos] + 
+                    cite_str + 
+                    processed_narrative[end_pos:]
+                )
+                
+    return processed_narrative
 
 async def original_chat_stream_flow(query: str, lens: str, api_key: str, request: Request, history: Optional[List[dict]] = None):
     """Original dashboard SSE streaming logic with inline search and grounding."""
@@ -2659,6 +2746,7 @@ async def original_chat_stream_flow(query: str, lens: str, api_key: str, request
 
             db_citations_only = list(citations)
             web_citations = []
+            grounding_supports = []
             
             yield f"data: {json.dumps({'status': 'synthesizing', 'message': 'Synthesizing verified records and generating response...'})}\n\n"
             
@@ -2685,11 +2773,16 @@ POLITICAL NEUTRALITY & LEGISLATIVE BALANCE:
   2. The opponents' or critics' arguments and concerns (e.g., risks of diminishing public funds, the lack of a clear repayment or remuneration plan, or the long-standing view in local governance that practices like interfund loans are highly risky or considered anathema).
 - Maintain a strictly objective, neutral, and journalistic tone. Present the policy change as a debated mechanism with tradeoffs rather than an unalloyed positive development.
 
-CRITICAL FORMATTING RULES:
-1. Do NOT include any introductory sentences, greeting, or conversational filler (e.g., "As the PennerAI Civic Intelligence Agent...", "I have compiled...", "Here is a breakdown..."). Begin your response immediately with the factual content, headers, or tables.
-2. Rely on the provided CONTEXT DATABASE RECORDS for any specific local audits or council actions.
-3. You MUST provide inline citations in your response using the exact database bracket labels (e.g., [DB-1], [DB-2]) at the end of sentences where facts from them are used. Every claim or statistic from the database records must be immediately followed by its database bracket label.
-4. If the provided CONTEXT DATABASE RECORDS contain records that are not directly related to answering the user's primary question, you may summarize them at the bottom. However, do NOT label this section as "Other [Jurisdiction] Local Governance Findings" or "Other [Jurisdiction] findings" or similar. Instead, you MUST label it exactly as the header "### Other Local Records (Correlations Engine Beta)" and introduce it with exactly the sentence: "The following additional records are provided as a courtesy of the PennerAI Correlations Engine (beta):"
+CRITICAL CITATION & SOURCES RULES:
+1. Do NOT include any bibliography, references, or "Sources" section at the bottom of your response. The application frontend will automatically render the sources separately under the message bubble.
+2. CITATION SEPARATION RULE:
+   - For any facts, statistics, quotes, or findings retrieved from the provided CONTEXT DATABASE RECORDS, you MUST use database bracket labels (e.g., [DB-1], [DB-2], etc.). These labels must match the exact record numbers listed under CONTEXT DATABASE RECORDS.
+   - For any facts or details retrieved from Google Search grounding, you MUST use web/search bracket labels (e.g., [1], [2], etc.).
+   - NEVER mix these two namespaces. Do NOT cite a database record using [1], [2], etc., and do NOT cite a web search result using [DB-1], [DB-2], etc.
+3. Every single claim, finding, statistic, or quote that you retrieve from the database records or web search grounding MUST be immediately followed by its corresponding bracket label (e.g. [DB-1] or [1]).
+4. If you reference external audits, laws, bills, or local school districts not covered by the CONTEXT DATABASE RECORDS (such as Marysville School District, SAFS updates, legislative details, etc.), you MUST perform a Google search for them so they are included in the grounding metadata. Do NOT write about them or cite them unless you have performed a Google search for them in this turn.
+5. If the provided CONTEXT DATABASE RECORDS contain records that are not directly related to answering the user's primary question, you may summarize them at the bottom. However, do NOT label this section as "Other [Jurisdiction] Local Governance Findings" or "Other [Jurisdiction] findings" or similar. Instead, you MUST label it exactly as the header "### Other Local Records (Correlations Engine Beta)" and introduce it with exactly the sentence: "The following additional records are provided as a courtesy of the PennerAI Correlations Engine (beta):"
+6. Do NOT include any bibliography, reference list, or "Sources" section at the end of your response. The application frontend will automatically render the sources separately under the message bubble.
 
 CONTEXT DATABASE RECORDS:
 {context_str}
@@ -2714,6 +2807,7 @@ CRITICAL DOMAIN RULES:
 - In Washington State, cities and school districts are entirely separate, independent local government entities. Do NOT generate questions that conflate them (e.g., do not ask about a city's spending on a school district, or school district contracts in a city's council).
 - Keep questions focused on the appropriate entity (e.g. school enrollment/budgets/levies for school districts, or city council votes/contracts for cities).
 - Use the specific, full name of the school district or city to maintain exact context (e.g., use "Bellevue School District" or "City of Bellevue" rather than just "Bellevue").
+- Do NOT use correlation meta-commands or preamble commands (like "Analyze the correlation report", "Explain correlation", "Draft response", etc.) as subject or contract entities in the questions. Instead, focus suggestions ONLY on the actual underlying governance topics (e.g. interfund loans, budget deficits, internal controls).
 
 Conversation History:
 {history_str}
@@ -2736,7 +2830,7 @@ Return ONLY a JSON list of strings, e.g. ["Question 1?", "Question 2?", "Questio
                         if resp.status_code == 200:
                             suggs = json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip())
                             if isinstance(suggs, list) and len(suggs) > 0:
-                                return [s[:80] for s in suggs[:3]]
+                                return [truncate_suggestion(s, 120) for s in suggs[:3]]
                 except Exception as e:
                     import traceback
                     print(f"Failed to generate dynamic suggestions: {repr(e)}")
@@ -2789,16 +2883,22 @@ Return ONLY a JSON list of strings, e.g. ["Question 1?", "Question 2?", "Questio
                 prompt = f"""You are the PennerAI Civic Intelligence Agent.
 Answer the user's question about Washington State local governance.
 Rely on the provided CONTEXT DATABASE RECORDS for any specific local audits or council actions.
-If the CONTEXT DATABASE RECORDS do not contain enough information to fully answer the user's question, use your search grounding tool to search the web for the latest factual information about Washington State cities, councils, and state laws.
+If you need to mention other school districts, laws, or audits to answer the user's question, or if you reference details not fully written in the CONTEXT DATABASE RECORDS, you MUST use your search grounding tool to search the web for them.
 
 CRITICAL REQUIREMENTS:
 1. Do NOT include any introductory sentences, conversational filler, greeting, or meta-commentary (such as "Here are the findings", "Based on my search...", "As the PennerAI..."). Begin the response immediately with the raw facts, headers, or tables.
-2. You MUST provide inline citations in your response using bracket notation (e.g., [1], [2], etc.) corresponding to your search grounding web sources.
-3. You MUST cite the provided CONTEXT DATABASE RECORDS using the exact database bracket labels (e.g., [DB-1], [DB-2], etc.) at the end of sentences where details from them are used.
+2. Do NOT write any "Sources" or bibliography section at the bottom of your response. The application frontend will automatically render the sources separately under the message bubble.
+3. STRICT CITATION SEPARATION RULE:
+   - You MUST cite the provided CONTEXT DATABASE RECORDS using the exact database bracket labels (e.g., [DB-1], [DB-2], etc.) at the end of sentences where details from them are used. Never cite database records using [1], [2], etc.
+   - You MUST cite web search grounding results using search bracket labels (e.g., [1], [2], etc.). Never cite web search results using [DB-1], [DB-2], etc.
+   - Do NOT include citations like [1], [2] unless you have performed a web search for them and they are linked in the grounding metadata.
 4. Every single claim, finding, statistic, or quote that you retrieve from the database records or web search grounding MUST be immediately followed by its corresponding bracket label (e.g. [DB-1] or [1]).
 5. If the provided CONTEXT DATABASE RECORDS contain records that are not directly related to answering the user's primary question, you may summarize them at the bottom. However, do NOT label this section as "Other [Jurisdiction] Local Governance Findings" or "Other [Jurisdiction] findings" or similar. Instead, you MUST label it exactly as the header "### Other Local Records (Correlations Engine Beta)" and introduce it with exactly the sentence: "The following additional records are provided as a courtesy of the PennerAI Correlations Engine (beta):"
+6. If you reference external audits, laws, bills, or local school districts not covered by the CONTEXT DATABASE RECORDS (such as Marysville School District, SAFS updates, legislative details, etc.), you MUST perform a Google search in this turn so they are included in the grounding metadata. Do NOT write about them or cite them unless you have performed a Google search for them in this turn.
 
 User Question: {query}
+CONTEXT DATABASE RECORDS:
+{context_str}
 """
                 contents = []
                 if history:
@@ -2835,12 +2935,48 @@ User Question: {query}
                     }
                 }
                 
+                print(f"DEBUG: Gemini payload:\n{json.dumps(payload, indent=2)}")
                 try:
                     async with client.stream("POST", url, headers=headers, json=payload, timeout=60.0) as response:
                         response.raise_for_status()
                         
                         buffer = ""
-                        async for chunk in response.aiter_text():
+                        queue = asyncio.Queue()
+                        
+                        async def read_stream():
+                            try:
+                                async for chunk in response.aiter_text():
+                                    await queue.put(chunk)
+                            except Exception as ex:
+                                await queue.put(ex)
+                            finally:
+                                await queue.put(None)
+                                
+                        stream_task = asyncio.create_task(read_stream())
+                        
+                        heartbeat_messages = [
+                            "Searching the web for Washington policy details...",
+                            "Reading and verifying source materials...",
+                            "Synthesizing database records and search grounding...",
+                            "Drafting response with inline citations..."
+                        ]
+                        heartbeat_idx = 0
+                        
+                        while True:
+                            try:
+                                item = await asyncio.wait_for(queue.get(), timeout=3.0)
+                            except asyncio.TimeoutError:
+                                msg = heartbeat_messages[heartbeat_idx % len(heartbeat_messages)]
+                                heartbeat_idx += 1
+                                yield f"data: {json.dumps({'status': 'synthesizing', 'message': msg})}\n\n"
+                                continue
+                                
+                            if item is None:
+                                break
+                            if isinstance(item, Exception):
+                                raise item
+                                
+                            chunk = item
                             if chunk:
                                 buffer += chunk
                                 while True:
@@ -2875,6 +3011,13 @@ User Question: {query}
                                         buffer = buffer[end_idx+1:]
                                         try:
                                             parsed = json.loads(obj_str)
+                                            if "candidates" in parsed:
+                                                cand = parsed["candidates"][0]
+                                                print(f"DEBUG: Parsed Gemini chunk candidate keys: {list(cand.keys())}")
+                                                if "groundingMetadata" in cand:
+                                                    print(f"DEBUG: FOUND groundingMetadata! Chunks: {len(cand['groundingMetadata'].get('groundingChunks', []))}")
+                                            else:
+                                                print(f"DEBUG: Parsed Gemini chunk root keys (no candidates): {list(parsed.keys())}")
                                             candidate = parsed["candidates"][0]
                                             
                                             # Yield text token
@@ -2893,8 +3036,14 @@ User Question: {query}
                                                         if uri and title:
                                                             if not any(c["url"] == uri for c in web_citations):
                                                                 web_citations.append({"text": title, "url": uri})
-                                        except Exception:
-                                            pass
+                                            if "groundingSupports" in metadata:
+                                                for support in metadata["groundingSupports"]:
+                                                    if support not in grounding_supports:
+                                                        grounding_supports.append(support)
+                                        except Exception as parse_err:
+                                            import traceback
+                                            print(f"Error parsing Gemini streaming chunk: {parse_err}")
+                                            traceback.print_exc()
                                     else:
                                         break
                 except Exception as e:
@@ -2913,7 +3062,32 @@ User Question: {query}
                         }
                         async with client.stream("POST", fallback_url, headers=membrane._headers(), json=fallback_payload, timeout=60.0) as fallback_response:
                             fallback_response.raise_for_status()
-                            async for line in fallback_response.aiter_lines():
+                            fallback_queue = asyncio.Queue()
+                            
+                            async def read_fallback():
+                                try:
+                                    async for line in fallback_response.aiter_lines():
+                                        await fallback_queue.put(line)
+                                except Exception as ex:
+                                    await fallback_queue.put(ex)
+                                finally:
+                                    await fallback_queue.put(None)
+                                    
+                            fallback_task = asyncio.create_task(read_fallback())
+                            
+                            while True:
+                                try:
+                                    item = await asyncio.wait_for(fallback_queue.get(), timeout=3.0)
+                                except asyncio.TimeoutError:
+                                    yield f"data: {json.dumps({'status': 'synthesizing', 'message': 'Generating response...'})}\n\n"
+                                    continue
+                                    
+                                if item is None:
+                                    break
+                                if isinstance(item, Exception):
+                                    raise item
+                                    
+                                line = item
                                 if line.startswith("data: "):
                                     content = line[6:].strip()
                                     if content == "[DONE]":
@@ -2947,6 +3121,13 @@ User Question: {query}
                         )
                         yield f"data: {json.dumps({'chunk': notice})}\n\n"
                     
+            # Post-process narrative to insert inline web citations
+            if grounding_supports:
+                try:
+                    full_narrative = insert_inline_citations(full_narrative, {"groundingSupports": grounding_supports})
+                except Exception as e:
+                    print(f"Error inserting inline citations: {e}")
+
             try:
                 suggestions = await asyncio.wait_for(suggestions_task, timeout=5.0)
             except Exception as e:
@@ -2963,6 +3144,7 @@ User Question: {query}
             }
 
             metadata_event = {
+                "content": full_narrative,
                 "citations": web_citations,
                 "db_citations": db_citations_only,
                 "suggestions": suggestions,
@@ -3105,8 +3287,8 @@ CRITICAL REQUIREMENTS:
         }
         
         log_api_usage(api_key, f"POST /api/v1/chat ({model})", prompt_tokens, completion_tokens)
-        response_time = int((time.time() - created_time) * 1000)
-        log_usage_event(
+        await asyncio.to_thread(
+            log_usage_event,
             ip_address=client_ip,
             anonymous_user_id=anon_user_id,
             session_id=f"agent-session-{chat_id}",
@@ -3192,7 +3374,8 @@ CRITICAL REQUIREMENTS:
                 completion_tokens = len(full_text) // 4
                 log_api_usage(api_key, f"POST /api/v1/chat (stream, {model})", prompt_tokens, completion_tokens)
                 response_time = int((time.time() - created_time) * 1000)
-                log_usage_event(
+                await asyncio.to_thread(
+                    log_usage_event,
                     ip_address=client_ip,
                     anonymous_user_id=anon_user_id,
                     session_id=f"agent-session-{chat_id}",

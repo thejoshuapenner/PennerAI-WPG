@@ -660,7 +660,12 @@ export default function Dashboard() {
   }, [threads, activeThreadId]);
 
   // Execute conversation search
-  const handleSubmit = async (e?: React.FormEvent, queryOverride?: string) => {
+  const handleSubmit = async (
+    e?: React.FormEvent, 
+    queryOverride?: string,
+    initialDbCitations?: any[],
+    initialCitations?: any[]
+  ) => {
     if (e) e.preventDefault();
     const userQuery = (queryOverride || query).trim();
     if (!userQuery) return;
@@ -686,8 +691,8 @@ export default function Dashboard() {
       role: 'assistant', 
       content: '', 
       loading: true,
-      citations: [],
-      dbCitations: [],
+      citations: initialCitations || [],
+      dbCitations: initialDbCitations || [],
       suggestions: [],
       correlations: []
     };
@@ -736,17 +741,20 @@ export default function Dashboard() {
       try {
         const decoder = new TextDecoder();
         let narrativeBuffer = "";
+        let streamBuffer = "";
 
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
 
-          const textChunk = decoder.decode(value, { stream: true });
-          const lines = textChunk.split('\n');
+          streamBuffer += decoder.decode(value, { stream: true });
+          const lines = streamBuffer.split('\n');
+          streamBuffer = lines.pop() || "";
 
           for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const dataStr = line.slice(6).trim();
+            const trimmed = line.trim();
+            if (trimmed.startsWith('data:')) {
+              const dataStr = trimmed.slice(trimmed.startsWith('data: ') ? 6 : 5).trim();
               if (!dataStr) continue;
 
               if (dataStr === '[DONE]') {
@@ -793,11 +801,12 @@ export default function Dashboard() {
                       if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
                         msgs[lastIdx] = {
                           ...msgs[lastIdx],
-                          citations: data.citations || [],
-                          dbCitations: data.db_citations || [],
-                          suggestions: data.suggestions || [],
-                          correlations: data.correlations || [],
-                          lensMetadata: data.lens_metadata || undefined
+                          content: data.content || msgs[lastIdx].content,
+                          citations: (data.citations && data.citations.length > 0) ? data.citations : msgs[lastIdx].citations,
+                          dbCitations: (data.db_citations && data.db_citations.length > 0) ? data.db_citations : msgs[lastIdx].dbCitations,
+                          suggestions: (data.suggestions && data.suggestions.length > 0) ? data.suggestions : msgs[lastIdx].suggestions,
+                          correlations: (data.correlations && data.correlations.length > 0) ? data.correlations : msgs[lastIdx].correlations,
+                          lensMetadata: data.lens_metadata || msgs[lastIdx].lensMetadata
                         };
                       }
                       return { ...t, messages: msgs };
@@ -1933,8 +1942,29 @@ export default function Dashboard() {
               <button 
                 onClick={() => {
                   setShowCorrModal(false);
-                  const queryStr = `Analyze the correlation report: "${selectedHomeCorr.title}" and explain its policy significance.`;
-                  handleSubmit(undefined, queryStr);
+                  const queryStr = `Analyze the correlation report: "${selectedHomeCorr.title}" and explain its policy significance.
+
+CRITICAL CITATION RULE: You MUST provide inline citations in your response using the exact database bracket labels (e.g., [DB-1], [DB-2]) at the end of sentences where facts from them are referenced. These citations will be rendered as interactive links for the user.
+
+Below is the report draft details for context:
+Headline: ${selectedHomeCorr.title}
+Teaser: ${selectedHomeCorr.hook}
+Markdown Content:
+${selectedHomeCorr.report_markdown}
+
+Supporting Citations:
+${(selectedHomeCorr.citations || []).map((c: any, idx: number) => `[DB-${idx + 1}] ${c.title || c.text} (${c.url})`).join('\n')}
+`;
+                  const mappedDbCites = (selectedHomeCorr.citations || []).map((c: any) => ({
+                    text: c.title || c.text,
+                    url: c.url,
+                    type: c.source === 'audit' ? 'audit' : c.source === 'council' ? 'council' : c.source === 'bill' ? 'bill' : 'grant'
+                  }));
+                  const mappedCites = (selectedHomeCorr.citations || []).map((c: any) => ({
+                    text: c.title || c.text,
+                    url: c.url
+                  }));
+                  handleSubmit(undefined, queryStr, mappedDbCites, mappedCites);
                   setSelectedHomeCorr(null);
                 }}
                 className="px-4 py-2.5 bg-evergreen hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-evergreen/10 cursor-pointer border-none"

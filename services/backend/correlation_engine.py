@@ -139,6 +139,79 @@ def make_diverse(records: list, limit: int = 25, max_per_jurisdiction: int = 2, 
             break
     return diverse_records
 
+def get_already_cited_records() -> dict:
+    """Returns a dict mapping source types to sets of cited IDs, e.g.
+    {'audit': {'1039555', ...}, 'bill': {'SSB 5412', ...}}
+    """
+    cited = {}
+    
+    # Try PostgreSQL first
+    try:
+        conn = get_pg_conn()
+        cur = conn.cursor()
+        # Verify correlations table exists in Postgres
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'correlations'
+            )
+        """)
+        table_exists = cur.fetchone()[0]
+        if table_exists:
+            cur.execute("SELECT citations FROM correlations")
+            rows = cur.fetchall()
+            for r in rows:
+                citations_raw = r[0]
+                if not citations_raw:
+                    continue
+                if isinstance(citations_raw, str):
+                    try:
+                        citations = json.loads(citations_raw)
+                    except Exception:
+                        citations = []
+                else:
+                    citations = citations_raw
+                for cit in citations:
+                    src = cit.get("source")
+                    cid = str(cit.get("id") or "")
+                    if src and cid:
+                        cited.setdefault(src, set()).add(cid)
+        cur.close()
+        conn.close()
+        return cited
+    except Exception as e:
+        print("PG fetch citations failed, falling back to SQLite:", e)
+        
+    # SQLite fallback
+    for db_name in ["sao_audits.db", "sao_2024.db", "municipal_intent.db"]:
+        conn = get_sqlite_conn(db_name)
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='correlations'")
+                if cur.fetchone():
+                    cur.execute("SELECT citations FROM correlations")
+                    rows = cur.fetchall()
+                    for r in rows:
+                        citations_raw = r[0]
+                        if not citations_raw:
+                            continue
+                        try:
+                            citations = json.loads(citations_raw)
+                        except Exception:
+                            citations = []
+                        for cit in citations:
+                            src = cit.get("source")
+                            cid = str(cit.get("id") or "")
+                            if src and cid:
+                                cited.setdefault(src, set()).add(cid)
+                cur.close()
+                conn.close()
+            except Exception as sq_err:
+                print(f"SQLite fetch citations failed for {db_name}:", sq_err)
+                
+    return cited
+
 def fetch_recent_data():
     """Fetch diverse findings, council actions, budgets, grants, and school financials from PostgreSQL or SQLite."""
     findings_pool = []
@@ -416,6 +489,22 @@ def fetch_recent_data():
                 conn.close()
             except Exception:
                 pass
+
+    # Load all cited records to filter them out of candidates
+    try:
+        cited = get_already_cited_records()
+    except Exception as ec:
+        print("Failed to get already cited records, using empty set:", ec)
+        cited = {}
+
+    # Filter out already-cited records from pools
+    findings_pool = [f for f in findings_pool if str(f.get("report_num")) not in cited.get("audit", set())]
+    actions_pool = [a for a in actions_pool if str(a.get("event_id")) not in cited.get("council", set())]
+    budgets_pool = [b for b in budgets_pool if str(b.get("id")) not in cited.get("budget", set())]
+    grants_pool = [g for g in grants_pool if str(g.get("id")) not in cited.get("grant", set())]
+    school_financials_pool = [s for s in school_financials_pool if str(s.get("id")) not in cited.get("school", set())]
+    contributions_pool = [c for c in contributions_pool if str(c.get("id")) not in cited.get("contribution", set())]
+    bills_pool = [b for b in bills_pool if str(b.get("bill_number")) not in cited.get("bill", set())]
 
     # De-duplicate findings by report_num
     unique_findings = []
