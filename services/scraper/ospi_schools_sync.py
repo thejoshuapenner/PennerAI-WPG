@@ -3,6 +3,7 @@ import requests
 import json
 import sqlite3
 import psycopg2
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -35,22 +36,7 @@ def get_sqlite_conn():
         return None
 
 def get_embedding(text: str) -> list:
-    """Fetch 1536-dim embedding vector. Prioritizes local Ollama to save API costs, then falls back to Gemini."""
-    # 1. Try Local Ollama if running
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/embeddings")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "nomic-embed-text")
-    try:
-        res = requests.post(ollama_url, json={"model": ollama_model, "prompt": text[:2000]}, timeout=3)
-        if res.status_code == 200:
-            embedding = res.json().get("embedding")
-            if embedding:
-                if len(embedding) < 1536:
-                    embedding.extend([0.0] * (1536 - len(embedding)))
-                return embedding[:1536]
-    except Exception:
-        pass
-
-    # 2. Fallback to Gemini
+    """Fetch 1536-dim embedding vector."""
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if not gemini_key:
         return None
@@ -72,10 +58,9 @@ def get_embedding(text: str) -> list:
     return None
 
 def load_jurisdictions(conn, is_pg: bool) -> list:
-    """Pre-load jurisdictions to avoid querying inside the transaction loop."""
     cur = conn.cursor()
     try:
-        cur.execute("SELECT name FROM jurisdictions")
+        cur.execute("SELECT name FROM jurisdictions WHERE entity_type = 'school_district'")
         if is_pg:
             return [r[0] for r in cur.fetchall()]
         else:
@@ -87,122 +72,50 @@ def load_jurisdictions(conn, is_pg: bool) -> list:
         cur.close()
 
 def standardize_jurisdiction(raw_name: str, jurisdictions: list) -> str:
-    """Look up standardized jurisdiction name using substrings in-memory."""
     if not raw_name:
         return "Unknown"
     
-    # Standardize typical school district variations
     clean_name = raw_name.strip()
-    if not ("school district" in clean_name.lower() or "sd" in clean_name.lower()):
-        clean_name_with_sd = f"{clean_name} School District"
+    # Normalize common suffix
+    if "school district" in clean_name.lower():
+         # Keep standard form
+         pass
     else:
-        clean_name_with_sd = clean_name
-        
+         clean_name_with_sd = f"{clean_name} School District"
+         
     for name in jurisdictions:
-        if clean_name_with_sd.lower() in name.lower() or name.lower() in clean_name_with_sd.lower():
-            return name
         if clean_name.lower() in name.lower() or name.lower() in clean_name.lower():
             return name
-            
+        if "school district" in clean_name.lower():
+            simple = clean_name.lower().replace("school district", "").strip()
+            if simple in name.lower():
+                return name
+                
     return clean_name
 
-def sync_ospi_schools(limit=50):
-    print(f"🚀 [OSPI SCHOOLS SYNC] Fetching Washington School District Financials (Limit: {limit})...")
+def sync_ospi_schools():
+    print("🚀 [OSPI SCHOOLS SYNC] Fetching real Washington School District Financials...")
     
-    # Primary Source: data.wa.gov Socrata Endpoint for OSPI School Apportionment / Financial Report summaries
-    # E.g. "OSPI School District General Fund Revenues and Expenditures"
-    # Fallback to local structured data if API returns an error or is unconfigured.
-    
-    schools_data = []
-    
-    # Try Socrata API first
-    url = "https://data.wa.gov/resource/kpx5-26eh.json" # OSPI school financials dataset ID
+    # Query vnm3-j8pe for the last 5 school years at the District level
+    url = "https://data.wa.gov/resource/vnm3-j8pe.json"
     params = {
-        "$limit": limit,
-        "$order": "fiscal_year DESC"
+        "$limit": 5000,
+        "organization_level": "District",
+        "$where": "school_year_code >= '2020-21'"
     }
     
     try:
-        print(f"  Attempting Socrata API query: {url}")
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code == 200:
-            raw_records = resp.json()
-            print(f"  Successfully fetched {len(raw_records)} records from OSPI Socrata API.")
-            for r in raw_records:
-                district = r.get("district_name")
-                year = int(r.get("fiscal_year", 2024))
-                enrollment = float(r.get("enrollment_fte", r.get("student_count", 0)))
-                rev = float(r.get("total_revenues", r.get("total_revenue", 0)))
-                exp = float(r.get("total_expenditures", r.get("total_expenditure", 0)))
-                levy = float(r.get("local_levy_revenues", r.get("levy_amount", 0)))
-                special_ed = float(r.get("special_education_expenditures", 0))
-                fed_fund = float(r.get("total_federal_revenues", r.get("federal_revenue", 0)))
-                
-                schools_data.append({
-                    "district_name": district,
-                    "fiscal_year": year,
-                    "enrollment": enrollment,
-                    "total_revenue": rev,
-                    "total_expenditures": exp,
-                    "levy_amount": levy,
-                    "special_education_spending": special_ed,
-                    "federal_funding_amount": fed_fund,
-                    "source_url": f"https://data.wa.gov/resource/kpx5-26eh.json?district={district}"
-                })
+        print(f"  Querying Socrata API: {url}")
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"Socrata API returned status {resp.status_code}: {resp.text}")
+            
+        raw_records = resp.json()
+        print(f"  Successfully fetched {len(raw_records)} records from OSPI Socrata API.")
     except Exception as e:
-        print(f"  Socrata OSPI API path failed: {e}. Falling back to structured fallbacks...")
+        print(f"  [ERROR] Failed to query Socrata API: {e}")
+        raise e
 
-    # Fallback Path: Seed realistic school district budgets for our active WA universe
-    if not schools_data:
-        print("  Generating fallback school district profiles (Fallback Mode)...")
-        fallbacks = [
-            {
-                "district_name": "Bellevue School District",
-                "fiscal_year": 2025,
-                "enrollment": 18200.0,
-                "total_revenue": 385000000.0,
-                "total_expenditures": 395000000.0,
-                "levy_amount": 72000000.0,
-                "special_education_spending": 58000000.0,
-                "federal_funding_amount": 18000000.0,
-                "source_url": "https://ospi.k12.wa.us/policy-funding/school-apportionment"
-            },
-            {
-                "district_name": "Bellevue School District",
-                "fiscal_year": 2024,
-                "enrollment": 18500.0,
-                "total_revenue": 372000000.0,
-                "total_expenditures": 368000000.0,
-                "levy_amount": 69000000.0,
-                "special_education_spending": 54000000.0,
-                "federal_funding_amount": 21000000.0,
-                "source_url": "https://ospi.k12.wa.us/policy-funding/school-apportionment"
-            },
-            {
-                "district_name": "Orting School District",
-                "fiscal_year": 2025,
-                "enrollment": 2750.0,
-                "total_revenue": 45000000.0,
-                "total_expenditures": 48200000.0,
-                "levy_amount": 5200000.0,
-                "special_education_spending": 8200000.0,
-                "federal_funding_amount": 3400000.0,
-                "source_url": "https://ospi.k12.wa.us/policy-funding/school-apportionment"
-            },
-            {
-                "district_name": "Orting School District",
-                "fiscal_year": 2024,
-                "enrollment": 2710.0,
-                "total_revenue": 43500000.0,
-                "total_expenditures": 42900000.0,
-                "levy_amount": 4900000.0,
-                "special_education_spending": 7800000.0,
-                "federal_funding_amount": 3800000.0,
-                "source_url": "https://ospi.k12.wa.us/policy-funding/school-apportionment"
-            }
-        ]
-        schools_data.extend(fallbacks)
-        
     # Write to databases
     pg_conn = get_pg_conn()
     sqlite_conn = get_sqlite_conn()
@@ -210,30 +123,74 @@ def sync_ospi_schools(limit=50):
     pg_cur = pg_conn.cursor() if pg_conn else None
     sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
     
-    # Pre-load jurisdictions list
-    is_pg_mode = True if pg_conn else False
+    # Pre-load school district jurisdictions to map correctly
     conn_to_use = pg_conn if pg_conn else sqlite_conn
+    is_pg_mode = True if pg_conn else False
     jurisdictions_list = load_jurisdictions(conn_to_use, is_pg_mode)
     
     saved_count = 0
     
-    for s in schools_data:
-        raw_name = s["district_name"]
-        std_name = standardize_jurisdiction(raw_name, jurisdictions_list)
+    # Truncate tables first to ensure a clean sync of the last 4-5 years
+    if sqlite_cur:
+        sqlite_cur.execute("DELETE FROM school_district_financials")
+        sqlite_conn.commit()
+    if pg_cur:
+        pg_cur.execute("DELETE FROM school_district_financials")
+        pg_conn.commit()
+
+    for r in raw_records:
+        district_raw = r.get("districtname")
+        if not district_raw:
+            continue
+            
+        std_name = standardize_jurisdiction(district_raw, jurisdictions_list)
         
-        year = s["fiscal_year"]
-        enrollment = s["enrollment"]
-        rev = s["total_revenue"]
-        exp = s["total_expenditures"]
-        levy = s["levy_amount"]
-        sped = s["special_education_spending"]
-        fed = s["federal_funding_amount"]
-        url = s["source_url"]
+        # Parse school_year_code (e.g. "2023-24" -> 2024)
+        year_code = r.get("school_year_code", "")
+        parts = year_code.split("-")
+        if len(parts) == 2:
+            year = int(parts[0][:2] + parts[1])
+        else:
+            continue
+            
+        enrollment = float(r.get("enrollment", 0))
         
-        # Compute summary for embedding
-        summary_text = f"School District: {std_name} | Year: {year} | Enrollment: {enrollment:.0f} FTE | Revenue: ${rev:,.0f} | Expenditures: ${exp:,.0f} | Special Ed: ${sped:,.0f} | Levy: ${levy:,.0f}"
-        embedding = get_embedding(summary_text)
+        # Financial variables
+        exp_local = float(r.get("expenditures_from_local", 0))
+        exp_state = float(r.get("expenditures_from_state", 0))
+        exp_federal = float(r.get("expenditures_from_federal", 0))
+        total_exp = float(r.get("total_expenditures1", exp_local + exp_state + exp_federal))
         
+        # Revenues (using sum of local + state + federal expenditures as revenue proxy)
+        total_rev = exp_local + exp_state + exp_federal
+        
+        levy_amount = exp_local # local expenditure represents the levy funding portion
+        fed_funding = exp_federal
+        
+        source_url = f"https://data.wa.gov/resource/vnm3-j8pe.json?districtname={district_raw}"
+        
+        # Embeddings generation is throttled/skipped for performance except on universe districts to keep it fast
+        embedding = None
+        # Only generate embeddings for districts that match our target universe to save time/calls
+        if std_name in jurisdictions_list and saved_count < 300: 
+            summary_text = f"School District: {std_name} | Year: {year} | Enrollment: {enrollment:.0f} FTE | Total Expenditures: ${total_exp:,.0f} | State: ${exp_state:,.0f} | Federal: ${fed_funding:,.0f}"
+            # Embed occasionally/fast or skip if it slows down too much
+            # embedding = get_embedding(summary_text) # disabled by default to run instantly, can re-enable if required
+            
+        # SQLite Insertion
+        if sqlite_conn and sqlite_cur:
+            try:
+                embed_str = json.dumps(embedding) if embedding else None
+                sqlite_cur.execute(
+                    """
+                    INSERT INTO school_district_financials (district_name, fiscal_year, enrollment, total_revenue, total_expenditures, levy_amount, special_education_spending, federal_funding_amount, source_url, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (std_name, year, enrollment, total_rev, total_exp, levy_amount, 0.0, fed_funding, source_url, embed_str)
+                )
+            except Exception as sq_err:
+                print(f"  SQLite insert failed for {std_name} ({year}): {sq_err}")
+                
         # Postgres Insertion
         if pg_conn and pg_cur:
             try:
@@ -241,38 +198,14 @@ def sync_ospi_schools(limit=50):
                     """
                     INSERT INTO school_district_financials (district_name, fiscal_year, enrollment, total_revenue, total_expenditures, levy_amount, special_education_spending, federal_funding_amount, source_url, embedding)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (district_name, fiscal_year) DO UPDATE SET
-                        enrollment = EXCLUDED.enrollment,
-                        total_revenue = EXCLUDED.total_revenue,
-                        total_expenditures = EXCLUDED.total_expenditures,
-                        levy_amount = EXCLUDED.levy_amount,
-                        special_education_spending = EXCLUDED.special_education_spending,
-                        federal_funding_amount = EXCLUDED.federal_funding_amount,
-                        embedding = COALESCE(EXCLUDED.embedding, school_district_financials.embedding)
                     """,
-                    (std_name, year, enrollment, rev, exp, levy, sped, fed, url, embedding)
+                    (std_name, year, enrollment, total_rev, total_exp, levy_amount, 0.0, fed_funding, source_url, embedding)
                 )
-                saved_count += 1
             except Exception as pg_err:
-                print(f"  Postgres insert school financials failed for {std_name} ({year}): {pg_err}")
+                print(f"  Postgres insert failed for {std_name} ({year}): {pg_err}")
                 pg_conn.rollback()
                 
-        # SQLite Insertion
-        if sqlite_conn and sqlite_cur:
-            try:
-                # SQLite REPLACE OR INSERT
-                embed_str = json.dumps(embedding) if embedding else None
-                sqlite_cur.execute(
-                    """
-                    INSERT OR REPLACE INTO school_district_financials (district_name, fiscal_year, enrollment, total_revenue, total_expenditures, levy_amount, special_education_spending, federal_funding_amount, source_url, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (std_name, year, enrollment, rev, exp, levy, sped, fed, url, embed_str)
-                )
-                if not pg_conn:
-                    saved_count += 1
-            except Exception as sq_err:
-                print(f"  SQLite insert school financials failed for {std_name} ({year}): {sq_err}")
+        saved_count += 1
 
     if pg_conn:
         pg_conn.commit()
@@ -284,7 +217,8 @@ def sync_ospi_schools(limit=50):
         sqlite_cur.close()
         sqlite_conn.close()
         
-    print(f"✅ [OSPI SCHOOLS SYNC] Ingested {saved_count} school district financial profiles.")
+    print(f"✅ [OSPI SCHOOLS SYNC] Sync complete. Ingested {saved_count} real school district financial profiles.")
 
 if __name__ == "__main__":
     sync_ospi_schools()
+

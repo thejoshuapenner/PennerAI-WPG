@@ -35,22 +35,7 @@ def get_sqlite_conn():
         return None
 
 def get_embedding(text: str) -> list:
-    """Fetch 1536-dim embedding vector. Prioritizes local Ollama to save API costs, then falls back to Gemini."""
-    # 1. Try Local Ollama if running
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/embeddings")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "nomic-embed-text")
-    try:
-        res = requests.post(ollama_url, json={"model": ollama_model, "prompt": text[:2000]}, timeout=3)
-        if res.status_code == 200:
-            embedding = res.json().get("embedding")
-            if embedding:
-                if len(embedding) < 1536:
-                    embedding.extend([0.0] * (1536 - len(embedding)))
-                return embedding[:1536]
-    except Exception:
-        pass
-
-    # 2. Fallback to Gemini
+    """Fetch 1536-dim embedding vector."""
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if not gemini_key:
         return None
@@ -72,11 +57,14 @@ def get_embedding(text: str) -> list:
     return None
 
 def standardize_jurisdiction(raw_name: str, conn, is_pg: bool) -> str:
-    """Look up standardized jurisdiction name using substrings."""
     if not raw_name:
         return "Unknown"
-    clean_name = raw_name.strip()
     
+    # Counties are named as "Adams County", "King County", etc.
+    clean_name = raw_name.strip()
+    if not clean_name.lower().endswith("county"):
+        clean_name = f"{clean_name} County"
+        
     cur = conn.cursor()
     try:
         if is_pg:
@@ -93,130 +81,50 @@ def standardize_jurisdiction(raw_name: str, conn, is_pg: bool) -> str:
         
     return clean_name
 
-def sync_fit_budgets(limit=50):
-    print(f"🚀 [FIT BUDGET SYNC] Fetching Washington Local Budgets (Limit: {limit})...")
+def sync_fit_budgets():
+    print("🚀 [FIT BUDGET SYNC] Fetching Washington Local County Road Budgets...")
     
-    # Primary Source: data.wa.gov Socrata Endpoint for SAO Local Government financial dataset
-    # E.g. "State Auditor Local Government BARS Financial Data"
-    # Fallback to local structured data if API returns an error or is unconfigured.
-    
-    budgets_data = []
-    
-    # Try Socrata API first
-    url = "https://data.wa.gov/resource/469c-z36p.json" # SAO FIT summary dataset ID
-    params = {
-        "$limit": limit,
-        "$order": "fiscal_year DESC"
-    }
-    
+    # 1. Fetch Revenues (29hx-2hie)
+    rev_url = "https://data.wa.gov/resource/29hx-2hie.json"
+    print(f"  Fetching revenues from Socrata: {rev_url}")
     try:
-        print(f"  Attempting Socrata API query: {url}")
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code == 200:
-            raw_records = resp.json()
-            print(f"  Successfully fetched {len(raw_records)} records from Socrata BARS API.")
-            for r in raw_records:
-                jurisdiction = r.get("government_name", r.get("entity_name"))
-                year = int(r.get("fiscal_year", 2024))
-                rev = float(r.get("total_revenues", r.get("revenues", 0)))
-                exp = float(r.get("total_expenditures", r.get("expenditures", 0)))
-                
-                # Extract fund balances
-                beg_bal = float(r.get("beginning_fund_balance", 0))
-                end_bal = float(r.get("ending_fund_balance", 0))
-                
-                # Breakdown category items if available in record
-                items = []
-                for cat, val in [("Public Safety", r.get("public_safety_expenditures")), 
-                                 ("General Administration", r.get("general_government_expenditures")),
-                                 ("Transportation", r.get("transportation_expenditures")),
-                                 ("Culture & Recreation", r.get("culture_recreation_expenditures"))]:
-                    if val is not None:
-                        items.append({
-                            "category_type": "expenditure",
-                            "major_category": cat,
-                            "amount": float(val)
-                        })
-                
-                budgets_data.append({
-                    "jurisdiction_name": jurisdiction,
-                    "entity_type": r.get("government_type", "city"),
-                    "fiscal_year": year,
-                    "total_revenue": rev,
-                    "total_expenditures": exp,
-                    "fund_balance_beginning": beg_bal,
-                    "fund_balance_ending": end_bal,
-                    "source_url": f"https://portal.sao.wa.gov/FIT/explore?year={year}",
-                    "items": items
-                })
+        resp = requests.get(rev_url, params={"$limit": 5000}, timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"Socrata revenue API returned {resp.status_code}: {resp.text}")
+        raw_revs = resp.json()
+        print(f"  Successfully fetched {len(raw_revs)} revenue records.")
     except Exception as e:
-        print(f"  Socrata FIT API path failed: {e}. Falling back to structured fallbacks...")
-
-    # Fallback Path: Seed realistic budget and budget category details for our active WA universe
-    if not budgets_data:
-        print("  Generating fallback budget profiles for Washington jurisdictions (Fallback Mode)...")
-        fallbacks = [
-            {
-                "jurisdiction_name": "Bellevue",
-                "entity_type": "city",
-                "fiscal_year": 2025,
-                "total_revenue": 340000000.0,
-                "total_expenditures": 325000000.0,
-                "fund_balance_beginning": 45000000.0,
-                "fund_balance_ending": 60000000.0,
-                "source_url": "https://portal.sao.wa.gov/FIT/explore",
-                "items": [
-                    {"category_type": "expenditure", "major_category": "Public Safety", "amount": 120000000.0, "account_code": "520", "description": "Police & Fire Protection"},
-                    {"category_type": "expenditure", "major_category": "Transportation", "amount": 85000000.0, "account_code": "540", "description": "Roads & Transit Maintenance"},
-                    {"category_type": "expenditure", "major_category": "General Administration", "amount": 45000000.0, "account_code": "510", "description": "Executive & HR Operations"}
-                ]
-            },
-            {
-                "jurisdiction_name": "Orting",
-                "entity_type": "city",
-                "fiscal_year": 2025,
-                "total_revenue": 14200000.0,
-                "total_expenditures": 15100000.0,
-                "fund_balance_beginning": 2100000.0,
-                "fund_balance_ending": 1200000.0,
-                "source_url": "https://portal.sao.wa.gov/FIT/explore",
-                "items": [
-                    {"category_type": "expenditure", "major_category": "Public Safety", "amount": 6200000.0, "account_code": "520", "description": "Police Service Contract"},
-                    {"category_type": "expenditure", "major_category": "Transportation", "amount": 2100000.0, "account_code": "540", "description": "Local Street Repairs"},
-                    {"category_type": "expenditure", "major_category": "General Administration", "amount": 1800000.0, "account_code": "510", "description": "Clerk & Finance Services"}
-                ]
-            },
-            {
-                "jurisdiction_name": "Orting",
-                "entity_type": "city",
-                "fiscal_year": 2024,
-                "total_revenue": 13900000.0,
-                "total_expenditures": 13500000.0,
-                "fund_balance_beginning": 1700000.0,
-                "fund_balance_ending": 2100000.0,
-                "source_url": "https://portal.sao.wa.gov/FIT/explore",
-                "items": [
-                    {"category_type": "expenditure", "major_category": "Public Safety", "amount": 5800000.0, "account_code": "520", "description": "Police Service"},
-                    {"category_type": "expenditure", "major_category": "Transportation", "amount": 1900000.0, "account_code": "540", "description": "Local Streets"}
-                ]
-            },
-            {
-                "jurisdiction_name": "Aberdeen",
-                "entity_type": "city",
-                "fiscal_year": 2025,
-                "total_revenue": 28500000.0,
-                "total_expenditures": 29800000.0,
-                "fund_balance_beginning": 4100000.0,
-                "fund_balance_ending": 2800000.0,
-                "source_url": "https://portal.sao.wa.gov/FIT/explore",
-                "items": [
-                    {"category_type": "expenditure", "major_category": "Public Safety", "amount": 11500000.0, "account_code": "520", "description": "Aberdeen Police & Fire"},
-                    {"category_type": "expenditure", "major_category": "Transportation", "amount": 4200000.0, "account_code": "540", "description": "Levee & Street Maintenance"}
-                ]
-            }
-        ]
-        budgets_data.extend(fallbacks)
+        print(f"  [ERROR] Failed to fetch revenues: {e}")
+        raise e
         
+    # 2. Fetch Expenditures (bxeh-ranj)
+    exp_url = "https://data.wa.gov/resource/bxeh-ranj.json"
+    print(f"  Fetching expenditures from Socrata: {exp_url}")
+    try:
+        resp = requests.get(exp_url, params={"$limit": 5000}, timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"Socrata expenditure API returned {resp.status_code}: {resp.text}")
+        raw_exps = resp.json()
+        print(f"  Successfully fetched {len(raw_exps)} expenditure records.")
+    except Exception as e:
+        print(f"  [ERROR] Failed to fetch expenditures: {e}")
+        raise e
+
+    # Build maps keying on (countyname, calendaryear)
+    rev_map = {}
+    for r in raw_revs:
+        county = r.get("countyname")
+        year = r.get("calendaryear")
+        if county and year:
+            rev_map[(county.strip().lower(), str(year))] = r
+            
+    exp_map = {}
+    for r in raw_exps:
+        county = r.get("countyname")
+        year = r.get("calendaryear")
+        if county and year:
+            exp_map[(county.strip().lower(), str(year))] = r
+
     # Write to databases
     pg_conn = get_pg_conn()
     sqlite_conn = get_sqlite_conn()
@@ -224,124 +132,172 @@ def sync_fit_budgets(limit=50):
     pg_cur = pg_conn.cursor() if pg_conn else None
     sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
     
+    # Truncate tables first
+    print("  Truncating budgets and budget_items tables...")
+    if sqlite_cur:
+        sqlite_cur.execute("DELETE FROM budget_items")
+        sqlite_cur.execute("DELETE FROM budgets")
+        sqlite_conn.commit()
+    if pg_cur:
+        pg_cur.execute("DELETE FROM budget_items")
+        pg_cur.execute("DELETE FROM budgets")
+        pg_conn.commit()
+
     saved_budget_count = 0
     saved_item_count = 0
     
-    for b in budgets_data:
-        raw_name = b["jurisdiction_name"]
+    # Revenue fields to extract
+    rev_fields = [
+        ("directdistribution", "Direct Distribution"),
+        ("tib", "Transportation Improvement Board (TIB)"),
+        ("rapprogram", "Rural Arterial Program (RAP)"),
+        ("cappprogram", "County Arterial Preservation (CAP)"),
+        ("propertytax", "Property Tax"),
+        ("timberexcisetax", "Timber Excise Tax"),
+        ("othertax", "Other Tax"),
+        ("federalgrants", "Federal Grants"),
+        ("federallands", "Federal Lands"),
+        ("miscellaneousother", "Miscellaneous Other")
+    ]
+    
+    # Expenditure fields to extract
+    exp_fields = [
+        ("construction", "Construction"),
+        ("maintenance", "Maintenance"),
+        ("administrationandoperations", "Administration & Operations"),
+        ("facilities", "Facilities"),
+        ("ferry", "Ferry"),
+        ("bondwarrant", "Bond Warrant"),
+        ("trafficpolicing", "Traffic Policing"),
+        ("other", "Other Expenditures")
+    ]
+
+    # Process alignment
+    keys = set(rev_map.keys()).intersection(set(exp_map.keys()))
+    print(f"  Aligned {len(keys)} budgets to process.")
+    
+    for key in sorted(keys):
+        county_raw, year_str = key
+        r_row = rev_map[key]
+        e_row = exp_map[key]
         
-        # Standardize recipient name
+        county_disp = r_row.get("countyname", "Unknown")
+        
         conn_to_use = pg_conn if pg_conn else sqlite_conn
         is_pg_mode = True if pg_conn else False
+        std_name = standardize_jurisdiction(county_disp, conn_to_use, is_pg_mode)
         
-        std_name = standardize_jurisdiction(raw_name, conn_to_use, is_pg_mode)
-        
-        entity_type = b["entity_type"]
-        year = b["fiscal_year"]
-        rev = b["total_revenue"]
-        exp = b["total_expenditures"]
-        beg_bal = b["fund_balance_beginning"]
-        end_bal = b["fund_balance_ending"]
-        url = b["source_url"]
+        year = int(year_str)
+        total_rev = float(r_row.get("total", 0))
+        total_exp = float(e_row.get("total", 0))
         
         budget_id = None
+        source_url = f"https://data.wa.gov/resource/bxeh-ranj.json?countyname={county_disp}"
         
-        # Postgres Parent Insertion
-        if pg_conn and pg_cur:
-            try:
-                pg_cur.execute(
-                    """
-                    INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (jurisdiction_name, fiscal_year) DO UPDATE SET
-                        total_revenue = EXCLUDED.total_revenue,
-                        total_expenditures = EXCLUDED.total_expenditures,
-                        fund_balance_beginning = EXCLUDED.fund_balance_beginning,
-                        fund_balance_ending = EXCLUDED.fund_balance_ending
-                    RETURNING id
-                    """,
-                    (std_name, entity_type, year, rev, exp, beg_bal, end_bal, url)
-                )
-                budget_id = pg_cur.fetchone()[0]
-                saved_budget_count += 1
-            except Exception as pg_err:
-                print(f"  Postgres insert budget parent failed for {std_name} ({year}): {pg_err}")
-                pg_conn.rollback()
-                
-        # SQLite Parent Insertion
+        # SQLite Budget Parent Insert
         if sqlite_conn and sqlite_cur:
             try:
-                # In SQLite, we use INSERT OR REPLACE
                 sqlite_cur.execute(
                     """
-                    INSERT OR REPLACE INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
+                    VALUES (?, 'county', ?, ?, ?, 0.0, 0.0, ?)
                     """,
-                    (std_name, entity_type, year, rev, exp, beg_bal, end_bal, url)
+                    (std_name, year, total_rev, total_exp, source_url)
                 )
-                
                 sqlite_cur.execute("SELECT last_insert_rowid()")
                 sqlite_budget_id = sqlite_cur.fetchone()[0]
                 if not pg_conn:
                     budget_id = sqlite_budget_id
                     saved_budget_count += 1
             except Exception as sq_err:
-                print(f"  SQLite insert budget parent failed for {std_name} ({year}): {sq_err}")
-
-        # Child Category Items Insertion
+                print(f"  SQLite insert budget failed for {std_name} ({year}): {sq_err}")
+                
+        # Postgres Budget Parent Insert
+        if pg_conn and pg_cur:
+            try:
+                pg_cur.execute(
+                    """
+                    INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
+                    VALUES (%s, 'county', %s, %s, %s, 0.0, 0.0, %s)
+                    RETURNING id
+                    """,
+                    (std_name, year, total_rev, total_exp, source_url)
+                )
+                budget_id = pg_cur.fetchone()[0]
+                saved_budget_count += 1
+            except Exception as pg_err:
+                print(f"  Postgres insert budget failed for {std_name} ({year}): {pg_err}")
+                pg_conn.rollback()
+                
+        # Ingest budget_items
         if budget_id:
-            for item in b.get("items", []):
-                cat_type = item["category_type"]
-                cat_name = item["major_category"]
-                amt = item["amount"]
-                code = item.get("account_code")
-                desc = item.get("description", "")
-                
-                # Compute embedding
-                summary_text = f"Budget Category: {cat_name} | Type: {cat_type} | Description: {desc} | Amount: ${amt:,.0f}"
-                embedding = get_embedding(summary_text)
-                
-                # Postgres Child Insertion
-                if pg_conn and pg_cur:
-                    try:
-                        # Avoid duplicates
-                        pg_cur.execute(
-                            "SELECT id FROM budget_items WHERE budget_id = %s AND category_type = %s AND major_category = %s LIMIT 1",
-                            (budget_id, cat_type, cat_name)
-                        )
-                        if not pg_cur.fetchone():
-                            pg_cur.execute(
-                                """
-                                INSERT INTO budget_items (budget_id, category_type, major_category, amount, account_code, description, embedding)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                """,
-                                (budget_id, cat_type, cat_name, amt, code, desc, embedding)
-                            )
-                            saved_item_count += 1
-                    except Exception as pg_child_err:
-                        print(f"  Postgres insert budget child failed: {pg_child_err}")
-                        pg_conn.rollback()
-                        
-                # SQLite Child Insertion
-                if sqlite_conn and sqlite_cur:
-                    try:
-                        sqlite_cur.execute(
-                            "SELECT id FROM budget_items WHERE budget_id = ? AND category_type = ? AND major_category = ? LIMIT 1",
-                            (budget_id, cat_type, cat_name)
-                        )
-                        if not sqlite_cur.fetchone():
-                            embed_str = json.dumps(embedding) if embedding else None
+            # 1. Ingest Revenues BARS
+            for field, label in rev_fields:
+                amt = float(r_row.get(field, 0))
+                if amt > 0:
+                    # SQLite Item Insert
+                    if sqlite_conn and sqlite_cur:
+                        try:
                             sqlite_cur.execute(
                                 """
                                 INSERT INTO budget_items (budget_id, category_type, major_category, amount, account_code, description, embedding)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                VALUES (?, 'revenue', ?, ?, 'BARS', ?, NULL)
                                 """,
-                                (budget_id, cat_type, cat_name, amt, code, desc, embed_str)
+                                (budget_id, label, amt, f"County Road Revenue: {label}")
                             )
                             if not pg_conn:
                                 saved_item_count += 1
-                    except Exception as sq_child_err:
-                        print(f"  SQLite insert budget child failed: {sq_child_err}")
+                        except Exception as sq_child_err:
+                            print(f"    SQLite insert revenue item failed: {sq_child_err}")
+                            
+                    # Postgres Item Insert
+                    if pg_conn and pg_cur:
+                        try:
+                            pg_cur.execute(
+                                """
+                                INSERT INTO budget_items (budget_id, category_type, major_category, amount, account_code, description, embedding)
+                                VALUES (%s, 'revenue', %s, %s, 'BARS', %s, NULL)
+                                """,
+                                (budget_id, label, amt, f"County Road Revenue: {label}")
+                            )
+                            saved_item_count += 1
+                        except Exception as pg_child_err:
+                            print(f"    Postgres insert revenue item failed: {pg_child_err}")
+                            pg_conn.rollback()
+                            
+            # 2. Ingest Expenditures BARS
+            for field, label in exp_fields:
+                amt = float(e_row.get(field, 0))
+                if amt > 0:
+                    # SQLite Item Insert
+                    if sqlite_conn and sqlite_cur:
+                        try:
+                            sqlite_cur.execute(
+                                """
+                                INSERT INTO budget_items (budget_id, category_type, major_category, amount, account_code, description, embedding)
+                                VALUES (?, 'expenditure', ?, ?, 'BARS', ?, NULL)
+                                """,
+                                (budget_id, label, amt, f"County Road Expenditure: {label}")
+                            )
+                            if not pg_conn:
+                                saved_item_count += 1
+                        except Exception as sq_child_err:
+                            print(f"    SQLite insert expenditure item failed: {sq_child_err}")
+                            
+                    # Postgres Item Insert
+                    if pg_conn and pg_cur:
+                        try:
+                            pg_cur.execute(
+                                """
+                                INSERT INTO budget_items (budget_id, category_type, major_category, amount, account_code, description, embedding)
+                                VALUES (%s, 'expenditure', %s, %s, 'BARS', %s, NULL)
+                                """,
+                                (budget_id, label, amt, f"County Road Expenditure: {label}")
+                            )
+                            saved_item_count += 1
+                        except Exception as pg_child_err:
+                            print(f"    Postgres insert expenditure item failed: {pg_child_err}")
+                            pg_conn.rollback()
 
     if pg_conn:
         pg_conn.commit()
@@ -357,3 +313,4 @@ def sync_fit_budgets(limit=50):
 
 if __name__ == "__main__":
     sync_fit_budgets()
+

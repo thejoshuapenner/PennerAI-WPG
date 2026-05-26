@@ -16,9 +16,6 @@ POSTGRES_URL = os.environ.get(
 )
 SQLITE_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/municipal_intent.db"
 
-MEMBRANE_API_KEY = os.environ.get("MEMBRANE_API_KEY")
-MEMBRANE_URL = "https://membrane-api.com/v1/chat/completions"
-
 def get_pg_conn():
     try:
         return psycopg2.connect(POSTGRES_URL)
@@ -30,6 +27,8 @@ def get_sqlite_conn():
     try:
         conn = sqlite3.connect(SQLITE_PATH)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
         return conn
     except Exception as e:
         print(f"SQLite connection failed: {e}")
@@ -79,94 +78,128 @@ def fetch_bill_details(biennium, bill_number):
     return details
 
 def classify_bill_policy(bill_title, bill_number) -> str:
-    """Uses Membrane to classify the policy area of a bill."""
-    if not MEMBRANE_API_KEY:
-        return "General Governance"
-        
-    headers = {
-        "Authorization": f"Bearer {MEMBRANE_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    """Uses a rule-based keyword classifier to categorize the bill's policy area."""
+    title_up = bill_title.upper()
     
-    payload = {
-        "model": "membrane-engagement-layer",
-        "messages": [
-            {
-                "role": "system",
-                "content": """You are a policy analyst tracking state mandates. 
-                Classify the main policy category of the given Washington State bill.
-                Choose ONE of the following categories:
-                - Unfunded Mandate
-                - Taxation & Finance
-                - Environmental & Growth Management (SEPA/GMA)
-                - Transportation & Infrastructure
-                - Labor & Pensions
-                - Public Records & Open Meetings
-                - Procurement & Contracting
-                - General Administration
-                
-                Return a JSON object: {"category": "Category Name"}"""
-            },
-            {
-                "role": "user",
-                "content": f"Classify this bill:\nBill ID: {bill_number}\nTitle: {bill_title}"
-            }
+    # Define mapping of category to lists of keywords
+    keywords_mapping = {
+        "Taxation & Finance": [
+            "TAX", "FINANCE", "REVENUE", "BUDGET", "APPROPRIATION", "LEVY", "BOND", "FISCAL", "PROPERTY TAX", 
+            "SALES TAX", "EXCISE", "FUNDS", "EXEMPTION", "ASSESSMENT", "SURCHARGE", "FEE", "TAXATION"
         ],
-        "response_format": {"type": "json_object"}
+        "Environmental & Growth Management (SEPA/GMA)": [
+            "ENVIRONMENT", "GROWTH MANAGEMENT", "GMA", "SEPA", "SHORELINE", "WILDLIFE", "FOREST", "WATER", "CLIMAT",
+            "CARBON", "EMISSION", "LAND USE", "ZONING", "CONSERVATION", "PARK", "HABITAT", "CLEAN ENERGY", "RECYCL",
+            "SOLAR", "WIND", "POLLUTION", "WASTE", "AGRICULTUR", "FISH"
+        ],
+        "Transportation & Infrastructure": [
+            "TRANSPORTATION", "ROAD", "HIGHWAY", "BRIDGE", "TRANSIT", "VEHICLE", "TRAFFIC", "PORT", "AIRCRAFT",
+            "RAILWAY", "STREET", "INFRASTRUCTURE", "FERRY", "AIRPORT", "PARKING"
+        ],
+        "Labor & Pensions": [
+            "LABOR", "PENSION", "RETIREMENT", "EMPLOYEE", "COLLECTIVE BARGAINING", "WAGE", "BENEFIT", "WORKERS' COMP",
+            "UNEMPLOYMENT", "SALARY", "UNION", "EMPLOYER", "WORKFORCE", "EMPLOYMENT", "LEAVE", "VACATION"
+        ],
+        "Public Records & Open Meetings": [
+            "PUBLIC RECORDS", "OPEN MEETINGS", "OPMA", "PRA", "DISCLOSURE", "PRIVACY", "RECORD KEEPING", "FREEDOM OF INFO",
+            "ARCHIVE", "TRANSPARENCY", "MEETING"
+        ],
+        "Procurement & Contracting": [
+            "PROCUREMENT", "CONTRACT", "BID", "PUBLIC WORKS", "PURCHASING", "VENDOR", "SUBCONTRACT", "AGREEMENT"
+        ],
+        "Unfunded Mandate": [
+            "MANDAT", "REQUIREMENT", "COMPEL", "IMPOSE", "OBLIGATION", "MANDATORY"
+        ]
     }
     
-    try:
-        resp = requests.post(MEMBRANE_URL, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            content = resp.json()['choices'][0]['message']['content']
-            if "```json" in content: content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content: content = content.split("```")[1].split("```")[0].strip()
-            return json.loads(content).get("category", "General Administration")
-    except Exception as e:
-        print(f"    Membrane classification failed for Bill {bill_number}: {e}")
-        
-    return "General Administration"
+    best_category = "General Administration"
+    max_matches = 0
+    
+    for category, keywords in keywords_mapping.items():
+        matches = 0
+        for kw in keywords:
+            if kw in title_up:
+                matches += 1
+        if matches > max_matches:
+            max_matches = matches
+            best_category = category
+            
+    return best_category
 
-def is_bill_in_sqlite(bill_id):
-    try:
-        conn = sqlite3.connect(SQLITE_PATH, timeout=30.0)
-        cur = conn.cursor()
-        cur.execute("SELECT bill_number FROM legislative_bills WHERE bill_number = ?", (bill_id,))
-        exists = cur.fetchone() is not None
-        cur.close()
-        conn.close()
-        return exists
-    except Exception as e:
-        print(f"    SQLite exists check failed: {e}")
-        return False
+def load_existing_bills() -> set:
+    """Loads all existing bill numbers from SQLite and Postgres to avoid duplicate processing."""
+    existing = set()
+    sqlite_conn = get_sqlite_conn()
+    if sqlite_conn:
+        try:
+            cur = sqlite_conn.cursor()
+            cur.execute("SELECT bill_number FROM legislative_bills")
+            for r in cur.fetchall():
+                existing.add(r['bill_number'])
+            cur.close()
+            sqlite_conn.close()
+        except Exception as e:
+            print(f"Failed loading bills from SQLite: {e}")
+            
+    pg_conn = get_pg_conn()
+    if pg_conn:
+        try:
+            cur = pg_conn.cursor()
+            cur.execute("SELECT bill_number FROM legislative_bills")
+            for r in cur.fetchall():
+                existing.add(r[0])
+            cur.close()
+            pg_conn.close()
+        except Exception as e:
+            print(f"Failed loading bills from Postgres: {e}")
+            
+    return existing
 
-def save_bill_to_sqlite(bill_id, title, biennium, sponsor, rcws_json, policy_cat):
-    try:
-        conn = sqlite3.connect(SQLITE_PATH, timeout=30.0)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO legislative_bills (bill_number, title, biennium, sponsor, summary, affected_rcws, affected_wacs, policy_category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (bill_id, title, biennium, sponsor, "", rcws_json, "[]", policy_cat)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"    SQLite insert failed: {e}")
-        return False
+def save_bill(bill_id, title, biennium, sponsor, rcws_json, policy_cat):
+    """Saves a bill to both SQLite and Postgres databases."""
+    sqlite_conn = get_sqlite_conn()
+    if sqlite_conn:
+        try:
+            cur = sqlite_conn.cursor()
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO legislative_bills (bill_number, title, biennium, sponsor, summary, affected_rcws, affected_wacs, policy_category)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (bill_id, title, biennium, sponsor, "", rcws_json, "[]", policy_cat)
+            )
+            sqlite_conn.commit()
+            cur.close()
+            sqlite_conn.close()
+        except Exception as e:
+            print(f"    SQLite insert failed for bill {bill_id}: {e}")
+            
+    pg_conn = get_pg_conn()
+    if pg_conn:
+        try:
+            cur = pg_conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO legislative_bills (bill_number, title, biennium, sponsor, summary, affected_rcws, affected_wacs, policy_category)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bill_number) DO NOTHING
+                """,
+                (bill_id, title, biennium, sponsor, "", rcws_json, "[]", policy_cat)
+            )
+            pg_conn.commit()
+            cur.close()
+            pg_conn.close()
+        except Exception as e:
+            print(f"    Postgres insert failed for bill {bill_id}: {e}")
 
 def sync_passed_bills(limit_per_biennium=100):
     print("🚀 [WALEG SYNC] Syncing passed legislation (2020-Present)...")
     
+    # Load all existing bill IDs from DB to prevent duplicate processing
+    existing_bills = load_existing_bills()
+    print(f"  Pre-loaded {len(existing_bills)} existing bills from database.")
+    
     bienniums = ["2019-20", "2021-22", "2023-24", "2025-26"]
-    
-    pg_conn = get_pg_conn()
-    pg_cur = pg_conn.cursor() if pg_conn else None
-    
     saved_count = 0
     
     biennium_agencies = [(b, a) for b in bienniums for a in ["House", "Senate"]]
@@ -187,17 +220,26 @@ def sync_passed_bills(limit_per_biennium=100):
             bills = root.findall(f'.//{ns}LegislationInfo')
             print(f"    Found {len(bills)} governor-signed bills.")
             
-            # Sync a subset per run to save performance/tokens, or run full in production
-            for i, bill in enumerate(bills[:limit_per_biennium]):
+            processed_in_biennium = 0
+            for bill in bills:
+                if processed_in_biennium >= limit_per_biennium:
+                    break
+                    
                 bill_num_node = bill.find(f'{ns}BillNumber')
                 bill_id_node = bill.find(f'{ns}BillId')
                 
                 bill_number = bill_num_node.text.strip() if bill_num_node is not None else ""
                 bill_id = bill_id_node.text.strip() if bill_id_node is not None else ""
                 
-                if not bill_number:
+                if not bill_number or not bill_id:
                     continue
                     
+                # Skip if already exists in DB (memory check)
+                if bill_id in existing_bills:
+                    continue
+                    
+                print(f"    * Processing new passed bill: {bill_id}...")
+                
                 # Fetch detailed info (Title and Sponsor) from GetLegislation
                 details = fetch_bill_details(biennium, bill_number)
                 title = details["title"]
@@ -206,58 +248,24 @@ def sync_passed_bills(limit_per_biennium=100):
                 if not title:
                     continue
                     
-                # Skip if already exists in DB
-                in_db = False
-                if pg_cur:
-                    pg_cur.execute("SELECT bill_number FROM legislative_bills WHERE bill_number = %s", (bill_id,))
-                    if pg_cur.fetchone():
-                        in_db = True
-                else:
-                    if is_bill_in_sqlite(bill_id):
-                        in_db = True
-                        
-                if in_db:
-                    continue
-                    
-                print(f"    * Processing passed bill: {bill_id} - {title[:60]}...")
-                
                 # Fetch RCWs cited
                 rcws = fetch_rcw_cites(biennium, bill_number)
                 rcws_json = json.dumps(rcws)
                 
-                # Classify policy area using Membrane
+                # Classify policy area using rule-based keywords
                 policy_cat = classify_bill_policy(title, bill_id)
                 
-                # Postgres Insert
-                if pg_conn and pg_cur:
-                    try:
-                        pg_cur.execute(
-                            """
-                            INSERT INTO legislative_bills (bill_number, title, biennium, sponsor, summary, affected_rcws, affected_wacs, policy_category)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (bill_number) DO NOTHING
-                            """,
-                            (bill_id, title, biennium, sponsor, "", rcws_json, "[]", policy_cat)
-                        )
-                        saved_count += 1
-                    except Exception as pg_err:
-                        print(f"    Postgres insert failed: {pg_err}")
-                        pg_conn.rollback()
-                        
-                # SQLite Insert
-                if save_bill_to_sqlite(bill_id, title, biennium, sponsor, rcws_json, policy_cat):
-                    if not pg_conn:
-                        saved_count += 1
-                        
+                # Save to database
+                save_bill(bill_id, title, biennium, sponsor, rcws_json, policy_cat)
+                
+                existing_bills.add(bill_id)
+                saved_count += 1
+                processed_in_biennium += 1
+                
         except Exception as e:
             print(f"    Error processing biennium {biennium}: {e}")
             
-    if pg_conn:
-        pg_conn.commit()
-        pg_cur.close()
-        pg_conn.close()
-        
-    print(f"✅ [WALEG SYNC] Sync complete. Ingested {saved_count} passed bills.")
+    print(f"✅ [WALEG SYNC] Sync complete. Ingested {saved_count} new passed bills.")
 
 if __name__ == "__main__":
     sync_passed_bills(limit_per_biennium=100)

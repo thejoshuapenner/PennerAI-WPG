@@ -3,6 +3,8 @@ import requests
 import json
 import sqlite3
 import psycopg2
+import time
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -34,262 +36,288 @@ def get_sqlite_conn():
         print(f"SQLite connection failed: {e}")
         return None
 
-def get_embedding(text: str) -> list:
-    """Fetch 1536-dim embedding vector. Prioritizes local Ollama to save API costs, then falls back to Gemini."""
-    # 1. Try Local Ollama if running
-    ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/embeddings")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "nomic-embed-text")
-    try:
-        res = requests.post(ollama_url, json={"model": ollama_model, "prompt": text[:2000]}, timeout=3)
-        if res.status_code == 200:
-            embedding = res.json().get("embedding")
-            if embedding:
-                if len(embedding) < 1536:
-                    embedding.extend([0.0] * (1536 - len(embedding)))
-                return embedding[:1536]
-    except Exception:
-        pass
-
-    # 2. Fallback to Gemini
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key:
-        return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={gemini_key}"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "model": "models/text-embedding-004",
-        "content": {"parts": [{"text": text[:2000]}]}
-    }
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
-        if res.status_code == 200:
-            values = res.json()["embedding"]["values"]
-            if len(values) == 768:
-                values.extend([0.0] * 768)
-            return values[:1536]
-    except Exception as e:
-        print(f"Gemini embedding failed: {e}")
-    return None
-
-def standardize_jurisdiction(raw_name: str, conn, is_pg: bool) -> str:
-    """Look up standardized jurisdiction name using substrings."""
-    if not raw_name:
-        return "Unknown"
-    clean_name = raw_name.strip()
-    
+def load_jurisdictions(conn, is_pg: bool) -> dict:
+    """Load and prepare jurisdictions by entity type."""
     cur = conn.cursor()
     try:
-        if is_pg:
-            cur.execute("SELECT name FROM jurisdictions WHERE name ILIKE %s LIMIT 1", (f"%{clean_name}%",))
-        else:
-            cur.execute("SELECT name FROM jurisdictions WHERE name LIKE ? LIMIT 1", (f"%{clean_name}%",))
-        row = cur.fetchone()
-        if row:
-            return row[0] if is_pg else row["name"]
-    except Exception:
-        pass
+        cur.execute("SELECT name, entity_type FROM jurisdictions")
+        rows = cur.fetchall()
+        
+        j_by_type = {
+            'school_district': [],
+            'port': [],
+            'county': [],
+            'city': []
+        }
+        
+        for r in rows:
+            name = r[0] if is_pg else r['name']
+            etype = r[1] if is_pg else r['entity_type']
+            
+            clean_name = name.strip()
+            if clean_name.startswith('"') and clean_name.endswith('"'):
+                clean_name = clean_name[1:-1].strip()
+                
+            base = clean_name
+            if etype == 'school_district':
+                base = re.sub(r'\s+School\s+District.*$', '', clean_name, flags=re.IGNORECASE)
+            elif etype == 'port':
+                base = re.sub(r'^Port\s+of\s+', '', clean_name, flags=re.IGNORECASE)
+            elif etype == 'county':
+                base = re.sub(r'\s+County$', '', clean_name, flags=re.IGNORECASE)
+                
+            j_by_type[etype].append({
+                'std_name': clean_name,
+                'base': base.upper().strip()
+            })
+            
+        return j_by_type
+    except Exception as e:
+        print(f"Failed loading jurisdictions: {e}")
+        return {}
     finally:
         cur.close()
+
+def match_recipient(recip_name, j_by_type) -> tuple:
+    """Match raw recipient name to standardized jurisdiction."""
+    if not recip_name:
+        return None, None
         
-    return clean_name
-
-def sync_grants(limit=100):
-    print(f"🚀 [GRANTS SYNC] Ingesting State & Federal Grants (Limit: {limit})...")
+    name_up = recip_name.upper().strip()
     
-    # Primary API: data.wa.gov Socrata Endpoint (e.g. Ecology Grants or Commerce Grant Awards)
-    # We will query a standard grant dataset (Commerce/Ecology/General) on Socrata.
-    # Fallback to mock/static data if API returns an error or is unconfigured.
-    
-    grants_data = []
-    
-    # Try Path 1: Socrata API for WA Ecology/Commerce Grants
-    url = "https://data.wa.gov/resource/xek9-r2bw.json" # Ecology Grants and Loans dataset ID
-    params = {
-        "$limit": limit,
-        "$order": "agreement_active_date DESC"
-    }
-    
-    try:
-        print(f"  Attempting Socrata API query: {url}")
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code == 200:
-            raw_records = resp.json()
-            print(f"  Successfully fetched {len(raw_records)} grant records from Socrata API.")
-            for r in raw_records:
-                # Map Socrata Ecology fields to our Grants schema
-                grant_title = r.get("project_title", "Environmental Cleanup Project")
-                grant_id = r.get("agreement_number", r.get("project_id"))
-                awarding_agency = "Department of Ecology"
-                recipient = r.get("recipient_name", "Unknown Recipient")
-                amount = float(r.get("agreement_funding", r.get("total_project_cost", 0)))
+    exclude_terms = [
+        "COLLEGE", "UNIVERSITY", "HOSPITAL", "CLINIC", "CANCER CENTER", "HEALTH CENTER", 
+        "ASSOCIATION", "SOCIETY", "CHAMBER OF COMMERCE", "FOUNDATION", "DEVELOPMENT SERVICE", 
+        "FAMILY SERVICES", "HOUSING AUTHORITY", "PUBLIC UTILITY DISTRICT", "CONSERVATION DISTRICT", 
+        "COALITION", "COMMUNITY SERVICES", "COMMUNITY ACTION", "HEALTHCARE", "CENTER FOR",
+        "PUD NO", "P.U.D."
+    ]
+    if any(term in name_up for term in exclude_terms):
+        return None, None
+        
+    # 1. Ports
+    if "PORT" in name_up:
+        for p in j_by_type['port']:
+            if f"PORT OF {p['base']}" in name_up or f"{p['base']} PORT" in name_up or name_up == p['base']:
+                return p['std_name'], 'port'
+            if "PORT OF" in name_up and p['base'] in name_up:
+                return p['std_name'], 'port'
                 
-                # Capture and parse date
-                active_date_str = r.get("agreement_active_date", "")
-                award_date = None
-                if active_date_str:
-                    try:
-                        award_date = datetime.strptime(active_date_str.split("T")[0], "%Y-%m-%d").date()
-                    except:
-                        pass
+    # 2. School Districts
+    if ("SCHOOL" in name_up or "DISTRICT" in name_up or " SD" in name_up or "PUBLIC SCHOOLS" in name_up) and "PUBLIC UTILITY DISTRICT" not in name_up:
+        for sd in j_by_type['school_district']:
+            if sd['base'] in name_up:
+                return sd['std_name'], 'school_district'
                 
-                grants_data.append({
-                    "grant_title": grant_title,
-                    "grant_id": grant_id,
-                    "awarding_agency": awarding_agency,
-                    "recipient": recipient,
-                    "amount": amount,
-                    "award_date": award_date,
-                    "purpose_category": r.get("project_type_description", "Environmental"),
-                    "funding_source": "State",
-                    "source_url": f"https://data.wa.gov/resource/xek9-r2bw.json?agreement_number={grant_id}"
-                })
-    except Exception as e:
-        print(f"  Socrata API path failed: {e}. Falling back to CSV/Excel pathway...")
-
-    # Path 2 Fallback: If Socrata was offline or returned empty, we generate realistic grant records
-    # mapped to actual WA universe cities/counties.
-    if not grants_data:
-        print("  Generating fallback grant awards for Washington jurisdictions (Fallback Mode)...")
-        fallbacks = [
-            {
-                "grant_title": "Child Care Stabilization Grant Award",
-                "grant_id": "GR-2025-091",
-                "awarding_agency": "Department of Children, Youth, and Families",
-                "recipient": "Bellevue",
-                "amount": 250000.0,
-                "award_date": datetime(2025, 6, 15).date(),
-                "purpose_category": "Child Care & Social Services",
-                "funding_source": "State",
-                "source_url": "https://data.wa.gov/resource/stabilization-grants"
-            },
-            {
-                "grant_title": "Clean Fuel Infrastructure Grant",
-                "grant_id": "ECY-2024-884",
-                "awarding_agency": "Department of Ecology",
-                "recipient": "Orting",
-                "amount": 750000.0,
-                "award_date": datetime(2024, 11, 20).date(),
-                "purpose_category": "Environmental & Infrastructure",
-                "funding_source": "State",
-                "source_url": "https://data.wa.gov/resource/ecology-grants"
-            },
-            {
-                "grant_title": "Federal Transit Stabilization Grant",
-                "grant_id": "FTA-WA-2025",
-                "awarding_agency": "Federal Transit Administration",
-                "recipient": "King County",
-                "amount": 4200000.0,
-                "award_date": datetime(2025, 3, 10).date(),
-                "purpose_category": "Transportation & Infrastructure",
-                "funding_source": "Federal",
-                "source_url": "https://www.usaspending.gov"
-            },
-            {
-                "grant_title": "Special Education Safety Net Grant",
-                "grant_id": "OSPI-SN-2025",
-                "awarding_agency": "Office of Superintendent of Public Instruction",
-                "recipient": "Bellevue School District",
-                "amount": 890000.0,
-                "award_date": datetime(2025, 2, 28).date(),
-                "purpose_category": "Special Education",
-                "funding_source": "State",
-                "source_url": "https://ospi.k12.wa.us/safety-net"
-            }
+    # 3. Counties
+    if "COUNTY" in name_up and "SCHOOL" not in name_up and "DISTRICT" not in name_up:
+        for c in j_by_type['county']:
+            if f"{c['base']} COUNTY" in name_up or f"COUNTY OF {c['base']}" in name_up:
+                return c['std_name'], 'county'
+            if c['base'] in name_up and "COUNTY" in name_up:
+                return c['std_name'], 'county'
+                
+    # 4. Cities
+    for city in j_by_type['city']:
+        base = city['base']
+        patterns = [
+            f"CITY OF {base}",
+            f"TOWN OF {base}",
+            f"{base}, CITY OF",
+            f"{base}, TOWN OF",
+            f"{base} CITY",
+            f"{base} TOWN"
         ]
-        grants_data.extend(fallbacks)
-        
-    # Write to databases
-    pg_conn = get_pg_conn()
+        if any(p in name_up for p in patterns) or name_up == base:
+            return city['std_name'], 'city'
+            
+    return None, None
+
+def sync_grants():
+    print("🚀 [GRANTS SYNC] Fetching real Federal Grants for Washington local entities from USA Spending...")
+    
+    # 1. Load jurisdictions list using a brief SQLite/Postgres connection
     sqlite_conn = get_sqlite_conn()
+    pg_conn = get_pg_conn()
     
-    pg_cur = pg_conn.cursor() if pg_conn else None
-    sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
+    conn_to_use = pg_conn if pg_conn else sqlite_conn
+    is_pg_mode = True if pg_conn else False
+    if not conn_to_use:
+        print("[ERROR] No database connections available.")
+        return
+        
+    j_by_type = load_jurisdictions(conn_to_use, is_pg_mode)
     
+    if sqlite_conn:
+        sqlite_conn.close()
+    if pg_conn:
+        pg_conn.close()
+        
+    # 2. Query USA Spending API in memory (no open database connections during network calls)
+    years = [2022, 2023, 2024, 2025, 2026]
+    grants_to_insert = []
+    seen_keys = set()
+    
+    url = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+    
+    for year in years:
+        print(f"\n  === Querying USA Spending for Year {year} ===")
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+        
+        # Fetch the top 3 pages (300 records) of grant awards in WA for each year
+        for page in range(1, 4):
+            payload = {
+                "filters": {
+                    "time_period": [
+                        {"start_date": start_date, "end_date": end_date}
+                    ],
+                    "recipient_locations": [
+                        {"country": "USA", "state": "WA"}
+                    ],
+                    "award_type_codes": ["02", "03", "04", "05"]
+                },
+                "fields": [
+                    "Award ID",
+                    "Recipient Name",
+                    "Award Amount",
+                    "Awarding Agency",
+                    "Awarding Sub Agency",
+                    "Start Date",
+                    "End Date",
+                    "Description",
+                    "generated_internal_id"
+                ],
+                "sort": "Award Amount",
+                "order": "desc",
+                "limit": 100,
+                "page": page
+            }
+            
+            print(f"    Fetching page {page}...")
+            try:
+                resp = requests.post(url, json=payload, timeout=30)
+                if resp.status_code != 200:
+                    print(f"    [ERROR] USA Spending API returned {resp.status_code}: {resp.text}")
+                    break
+                    
+                results = resp.json().get("results", [])
+                if not results:
+                    break
+                    
+                for r in results:
+                    recip = r.get("Recipient Name", "")
+                    std_name, etype = match_recipient(recip, j_by_type)
+                    if not std_name:
+                        continue
+                        
+                    grant_id = r.get("Award ID", "Unknown ID")
+                    amount = float(r.get("Award Amount", 0.0))
+                    
+                    desc = r.get("Description", "")
+                    if desc:
+                        title = desc[:250] + ("..." if len(desc) > 250 else "")
+                    else:
+                        title = f"{r.get('Awarding Agency', 'Federal')} Grant Award"
+                        
+                    agency = r.get("Awarding Agency", "Federal Agency")
+                    if r.get("Awarding Sub Agency"):
+                        agency = f"{agency} ({r.get('Awarding Sub Agency')})"
+                        
+                    award_date_str = r.get("Start Date")
+                    perf_start = r.get("Start Date")
+                    perf_end = r.get("End Date")
+                    purpose = r.get("Awarding Sub Agency", "Federal Assistance")
+                    source = "Federal"
+                    
+                    internal_id = r.get("generated_internal_id", "")
+                    source_url = f"https://www.usaspending.gov/award/{internal_id}" if internal_id else "https://www.usaspending.gov/"
+                    
+                    # Deduplicate in-memory using a unique key
+                    unique_key = (grant_id, title, std_name, amount)
+                    if unique_key in seen_keys:
+                        continue
+                    seen_keys.add(unique_key)
+                    
+                    grants_to_insert.append((
+                        title, grant_id, agency, std_name, etype, amount, 
+                        award_date_str, perf_start, perf_end, purpose, source, source_url
+                    ))
+                    
+                time.sleep(0.5) # Politeness delay
+                
+            except Exception as e:
+                print(f"    [ERROR] Request failed on page {page}: {e}")
+                break
+                
+    print(f"\n  Fetched and matched {len(grants_to_insert)} awards in memory.")
+    
+    # 3. Perform database operations in one fast transaction
     saved_count = 0
     
-    for g in grants_data:
-        recipient_raw = g["recipient"]
-        
-        # Standardize recipient name
-        conn_to_use = pg_conn if pg_conn else sqlite_conn
-        is_pg_mode = True if pg_conn else False
-        
-        recipient_std = standardize_jurisdiction(recipient_raw, conn_to_use, is_pg_mode)
-        
-        title = g["grant_title"]
-        grant_id = g["grant_id"]
-        agency = g["awarding_agency"]
-        amount = g["amount"]
-        award_date = g["award_date"]
-        purpose = g["purpose_category"]
-        source = g["funding_source"]
-        url = g["source_url"]
-        
-        # Compute summary for embedding (only title + purpose, very short)
-        summary_text = f"Grant: {title} | Recipient: {recipient_std} | Purpose: {purpose}"
-        embedding = get_embedding(summary_text)
-        
-        # Postgres Insertion
-        if pg_conn and pg_cur:
-            try:
-                pg_cur.execute(
-                    """
-                    SELECT id FROM grants 
-                    WHERE (grant_id = %s OR (grant_title = %s AND recipient_jurisdiction = %s AND award_amount = %s))
-                    LIMIT 1
-                    """,
-                    (grant_id, title, recipient_std, amount)
-                )
-                if not pg_cur.fetchone():
-                    pg_cur.execute(
-                        """
-                        INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, award_amount, award_date, purpose_category, funding_source, source_url, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (title, grant_id, agency, recipient_std, amount, award_date, purpose, source, url, embedding)
-                    )
-                    saved_count += 1
-            except Exception as pg_err:
-                print(f"  Postgres insert failed for grant {grant_id}: {pg_err}")
-                pg_conn.rollback()
-                
-        # SQLite Insertion
-        if sqlite_conn and sqlite_cur:
-            try:
-                sqlite_cur.execute(
-                    """
-                    SELECT id FROM grants 
-                    WHERE (grant_id = ? OR (grant_title = ? AND recipient_jurisdiction = ? AND award_amount = ?))
-                    LIMIT 1
-                    """,
-                    (grant_id, title, recipient_std, amount)
-                )
-                if not sqlite_cur.fetchone():
-                    # SQLite stores embedding as JSON string
-                    embed_str = json.dumps(embedding) if embedding else None
-                    sqlite_cur.execute(
-                        """
-                        INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, award_amount, award_date, purpose_category, funding_source, source_url, embedding)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (title, grant_id, agency, recipient_std, amount, award_date.isoformat() if award_date else None, purpose, source, url, embed_str)
-                    )
-                    if not pg_conn:
-                        saved_count += 1
-            except Exception as sq_err:
-                print(f"  SQLite insert failed for grant {grant_id}: {sq_err}")
-                
+    # Re-open database connections for insertion
+    sqlite_conn = get_sqlite_conn()
+    pg_conn = get_pg_conn()
+    
+    sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
+    pg_cur = pg_conn.cursor() if pg_conn else None
+    
+    print("  Truncating grants tables...")
+    if sqlite_cur:
+        try:
+            sqlite_cur.execute("DELETE FROM grants")
+            sqlite_conn.commit()
+        except Exception as e:
+            print(f"  [ERROR] SQLite truncate failed: {e}")
+    if pg_cur:
+        try:
+            pg_cur.execute("DELETE FROM grants")
+            pg_conn.commit()
+        except Exception as e:
+            print(f"  [ERROR] Postgres truncate failed: {e}")
+            
+    # Batch Insert SQLite
+    if sqlite_conn and sqlite_cur and grants_to_insert:
+        print("  Inserting records into SQLite...")
+        try:
+            sqlite_cur.executemany(
+                """
+                INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, recipient_entity_type, award_amount, award_date, performance_period_start, performance_period_end, purpose_category, funding_source, source_url, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                grants_to_insert
+            )
+            sqlite_conn.commit()
+            if not pg_conn:
+                saved_count = len(grants_to_insert)
+        except Exception as e:
+            print(f"  [ERROR] SQLite batch insert failed: {e}")
+            
+    # Batch Insert Postgres
+    if pg_conn and pg_cur and grants_to_insert:
+        print("  Inserting records into Postgres...")
+        try:
+            pg_cur.executemany(
+                """
+                INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, recipient_entity_type, award_amount, award_date, performance_period_start, performance_period_end, purpose_category, funding_source, source_url, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                """,
+                grants_to_insert
+            )
+            pg_conn.commit()
+            saved_count = len(grants_to_insert)
+        except Exception as e:
+            print(f"  [ERROR] Postgres batch insert failed: {e}")
+            pg_conn.rollback()
+            
+    if sqlite_conn:
+        sqlite_cur.close()
+        sqlite_conn.close()
     if pg_conn:
-        pg_conn.commit()
         pg_cur.close()
         pg_conn.close()
         
-    if sqlite_conn:
-        sqlite_conn.commit()
-        sqlite_cur.close()
-        sqlite_conn.close()
-        
-    print(f"✅ [GRANTS SYNC] Ingested {saved_count} grant records.")
+    print(f"\n✅ [GRANTS SYNC] Ingested {saved_count} real federal grant records.")
 
 if __name__ == "__main__":
     sync_grants()
