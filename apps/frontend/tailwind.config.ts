@@ -9,17 +9,18 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        obsidian: "#0B0D14",
-        gunmetal: "#161922",
-        critical: "#E11D48",
-        oracle: "#38BDF8",
-        pass: "#10B981",
-        evergreen: '#004D40',
-        mist: '#f8fafc',
-        void: '#0f172a'
+        obsidian: "#F8FAFC", // Light Slate-50 background
+        gunmetal: "#FFFFFF", // Pure white card/bubble background
+        critical: "#DC2626", // Readable red-600
+        oracle: "#0284C7",   // Readable sky-600
+        pass: "#059669",     // Readable emerald-600
+        evergreen: '#0C5A4C', // Deep rich teal-green accent
+        mist: '#0F172A',     // Charcoal slate-900 text color
+        void: '#E2E8F0'      // Light slate-200 border color
       },
       fontFamily: {
-        sans: ['Geist', 'Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        sans: ['Inter', 'Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        serif: ['Playfair Display', 'Georgia', 'ui-serif', 'serif'],
       },
       letterSpacing: {
         tight: '-0.015em',

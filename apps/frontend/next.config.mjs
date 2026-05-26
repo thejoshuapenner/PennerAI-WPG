@@ -1,5 +1,12 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  distDir: process.env.NODE_ENV === 'development' ? '/tmp/next-penner-ai-wpg-dev' : '.next',
+  webpack: (config, { dev }) => {
+    if (dev) {
+      config.cache = false;
+    }
+    return config;
+  },
   async rewrites() {
     return [
       {

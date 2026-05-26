@@ -53,3 +53,56 @@ class AlertSubscriptionSchema(BaseModel):
     topics: str
     jurisdiction: Optional[str] = None
     query: Optional[str] = None
+
+class JurisdictionSchema(BaseModel):
+    name: str
+    entity_type: str
+    county: Optional[str] = None
+    population: Optional[int] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class BudgetSchema(BaseModel):
+    jurisdiction_name: str
+    entity_type: str
+    fiscal_year: int
+    total_revenue: float
+    total_expenditures: float
+    fund_balance_beginning: Optional[float] = None
+    fund_balance_ending: Optional[float] = None
+    source_url: Optional[str] = None
+
+class BudgetItemSchema(BaseModel):
+    category_type: str
+    major_category: str
+    amount: float
+    account_code: Optional[str] = None
+    description: Optional[str] = None
+    embedding: Optional[List[float]] = None
+
+class GrantSchema(BaseModel):
+    grant_title: str
+    grant_id: Optional[str] = None
+    awarding_agency: str
+    recipient_jurisdiction: str
+    recipient_entity_type: Optional[str] = None
+    award_amount: float
+    award_date: Optional[date] = None
+    performance_period_start: Optional[date] = None
+    performance_period_end: Optional[date] = None
+    purpose_category: Optional[str] = None
+    funding_source: Optional[str] = None
+    source_url: Optional[str] = None
+    embedding: Optional[List[float]] = None
+
+class SchoolDistrictFinancialsSchema(BaseModel):
+    district_name: str
+    fiscal_year: int
+    enrollment: Optional[float] = None
+    total_revenue: float
+    total_expenditures: float
+    levy_amount: Optional[float] = None
+    special_education_spending: Optional[float] = None
+    federal_funding_amount: Optional[float] = None
+    source_url: Optional[str] = None
+    embedding: Optional[List[float]] = None

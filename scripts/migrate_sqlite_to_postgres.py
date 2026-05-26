@@ -102,8 +102,16 @@ def migrate_findings(pg_cursor):
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
+        # Check if year column exists in this table
+        c.execute(f"PRAGMA table_info({table})")
+        columns = [col[1] for col in c.fetchall()]
+        has_year = 'year' in columns
+        
         try:
-            c.execute(f"SELECT report_num, jurisdiction, type, category, summary, root_cause, dollar_impact FROM {table}")
+            q_cols = "report_num, jurisdiction, type, category, summary, root_cause, dollar_impact"
+            if has_year:
+                q_cols += ", year"
+            c.execute(f"SELECT {q_cols} FROM {table}")
             rows = c.fetchall()
         except sqlite3.OperationalError as e:
             print(f"  Error reading table {table} from {filename}: {e}")
@@ -116,6 +124,18 @@ def migrate_findings(pg_cursor):
             if report_num in report_nums_migrated or not report_num:
                 continue
                 
+            # Parse year from table or find default
+            year = None
+            if has_year:
+                year = row[7]
+            if not year:
+                import re
+                years_in_sum = re.findall(r'\b(202\d)\b', str(row[4]))
+                if years_in_sum:
+                    year = int(max(years_in_sum))
+                else:
+                    year = 2024 if filename == "sao_2024.db" else 2025
+                    
             # Compute embedding for summary
             embedding = None
             if GEMINI_API_KEY:
@@ -131,6 +151,7 @@ def migrate_findings(pg_cursor):
                 row[4], # summary
                 row[5], # root_cause
                 row[6] or 0, # dollar_impact
+                year,
                 embedding
             ))
             report_nums_migrated.add(report_num)
@@ -138,7 +159,7 @@ def migrate_findings(pg_cursor):
         if findings_to_insert:
             insert_query = """
             INSERT INTO findings (
-                report_num, jurisdiction, type, category, summary, root_cause, dollar_impact, embedding
+                report_num, jurisdiction, type, category, summary, root_cause, dollar_impact, year, embedding
             ) VALUES %s
             ON CONFLICT (report_num) DO UPDATE SET
                 jurisdiction = EXCLUDED.jurisdiction,
@@ -147,6 +168,7 @@ def migrate_findings(pg_cursor):
                 summary = EXCLUDED.summary,
                 root_cause = EXCLUDED.root_cause,
                 dollar_impact = EXCLUDED.dollar_impact,
+                year = EXCLUDED.year,
                 embedding = COALESCE(EXCLUDED.embedding, findings.embedding)
             """
             execute_values(pg_cursor, insert_query, findings_to_insert)
