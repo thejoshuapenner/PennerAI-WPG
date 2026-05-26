@@ -70,8 +70,8 @@ const parseInlineMarkdown = (
   return parts.map((part, i) => {
     const isBold = i % 2 === 1;
     
-    // Parse brackets like [1], [2], [DB-1], [DB-2], or 7-digit report numbers (e.g., 1037463)
-    const citationRegex = /\[(\d+)\]|\[DB-(\d+)\]|\b(1\d{6})\b/gi;
+    // Parse markdown links like [Link Text](url), brackets like [1], [2], [DB-1], [DB-2], or 7-digit report numbers (e.g., 1037463)
+    const citationRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\[(\d+)\]|\[DB-(\d+)\]|\b(1\d{6})\b/gi;
     const subParts: React.ReactNode[] = [];
     let lastIndex = 0;
     let match;
@@ -83,9 +83,23 @@ const parseInlineMarkdown = (
         subParts.push(part.substring(lastIndex, matchIndex));
       }
       
-      if (match[1]) {
+      if (match[1] && match[2]) {
+        // Standard markdown link [Link Text](url)
+        subParts.push(
+          <a 
+            key={`link-${matchIndex}`}
+            href={match[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-evergreen hover:text-emerald-800 underline font-bold transition-all cursor-pointer inline-flex items-center gap-0.5"
+          >
+            {match[1]}
+            <ExternalLink className="w-2.5 h-2.5 inline-block opacity-80" />
+          </a>
+        );
+      } else if (match[3]) {
         // Standard bracket [N] citation (Web/General citation)
-        const num = parseInt(match[1], 10);
+        const num = parseInt(match[3], 10);
         if (citations && num > 0 && num <= citations.length) {
           const cite = citations[num - 1];
           const isDimmed = activeLens !== 'comprehensive';
@@ -105,9 +119,9 @@ const parseInlineMarkdown = (
         } else {
           subParts.push(match[0]);
         }
-      } else if (match[2]) {
+      } else if (match[4]) {
         // Database citation [DB-N]
-        const num = parseInt(match[2], 10);
+        const num = parseInt(match[4], 10);
         if (dbCitations && num > 0 && num <= dbCitations.length) {
           const cite = dbCitations[num - 1];
           
@@ -145,9 +159,9 @@ const parseInlineMarkdown = (
         } else {
           subParts.push(match[0]);
         }
-      } else if (match[3]) {
+      } else if (match[5]) {
         // SAO Report number (e.g. 1037463)
-        const reportNum = match[3];
+        const reportNum = match[5];
         subParts.push(
           <button 
             key={`cite-sao-${reportNum}-${matchIndex}`}
@@ -188,7 +202,8 @@ const renderMessageContent = (
   activeLens: 'comprehensive' | 'audits' | 'council' | 'bills' | 'grants'
 ) => {
   if (!content) return null;
-  const lines = content.split('\n');
+  const cleanedContent = content.replace(/\[([^\]]+)\]\s*\((https?:\/\/[^\s)]+)\)/g, '[$1]($2)');
+  const lines = cleanedContent.split('\n');
   const elements: React.ReactNode[] = [];
   let currentTable: string[][] = [];
   let isTable = false;
@@ -1275,7 +1290,7 @@ export default function Dashboard() {
                             <div className="whitespace-pre-wrap font-medium text-xs md:text-sm text-white">
                               {msg.content}
                             </div>
-                          ) : msg.loading ? (
+                          ) : msg.loading && !msg.content ? (
                             <div className="py-4 px-2 space-y-4 w-full text-slate-800">
                               {/* Active Status Header */}
                               <div className="flex items-center gap-2.5">
@@ -1318,6 +1333,14 @@ export default function Dashboard() {
                           ) : (
                             <div className="space-y-4 font-medium">
                               {renderMessageContent(msg.content, msg.citations, msg.dbCitations, handleCitationClick, lens)}
+                              {msg.loading && (
+                                <div className="flex items-center gap-2 pt-2.5 border-t border-slate-100 mt-3 text-slate-400">
+                                  <RefreshCw className="w-3 h-3 animate-spin text-evergreen" />
+                                  <span className="text-[10px] font-bold uppercase tracking-wider text-evergreen animate-pulse">
+                                    {msg.statusMessage || "Synthesizing response..."}
+                                  </span>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
@@ -1840,8 +1863,21 @@ export default function Dashboard() {
               <div className="p-4 bg-slate-50 border-l-2 border-emerald-500 rounded-r-xl italic text-slate-650 font-medium">
                 "{selectedHomeCorr.hook}"
               </div>
-              <div className="prose prose-sm max-w-none text-slate-700 leading-relaxed font-medium space-y-4 whitespace-pre-wrap">
-                {selectedHomeCorr.report_markdown}
+              <div className="prose prose-sm max-w-none text-slate-700 leading-relaxed font-medium space-y-4">
+                {renderMessageContent(
+                  selectedHomeCorr.report_markdown,
+                  (selectedHomeCorr.citations || []).map((c: any) => ({
+                    text: c.title,
+                    url: c.url
+                  })),
+                  (selectedHomeCorr.citations || []).map((c: any) => ({
+                    text: c.title,
+                    url: c.url,
+                    type: c.source === 'audit' ? 'audit' : c.source === 'council' ? 'council' : c.source === 'bill' ? 'bill' : 'grant'
+                  })),
+                  handleCitationClick,
+                  lens
+                )}
               </div>
               
               {/* Citations section */}
@@ -1856,11 +1892,21 @@ export default function Dashboard() {
                       >
                         <div className="min-w-0 pr-2">
                           <span className={`text-[8px] font-black uppercase px-1.5 py-0.2 rounded border ${
-                            cit.source === 'audit' 
-                              ? 'bg-purple-50 text-purple-700 border-purple-200' 
-                              : 'bg-blue-50 text-blue-700 border-blue-200'
+                            cit.source === 'audit' ? 'bg-purple-50 text-purple-700 border-purple-200' :
+                            cit.source === 'council' ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                            cit.source === 'budget' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                            cit.source === 'grant' ? 'bg-amber-50 text-amber-700 border-amber-250' :
+                            cit.source === 'school' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
+                            cit.source === 'contribution' ? 'bg-rose-50 text-rose-700 border-rose-200' :
+                            'bg-teal-50 text-teal-700 border-teal-200'
                           }`}>
-                            {cit.source === 'audit' ? 'Audit' : 'Council'}
+                            {cit.source === 'audit' ? 'Audit' :
+                             cit.source === 'council' ? 'Council' :
+                             cit.source === 'budget' ? 'Budget' :
+                             cit.source === 'grant' ? 'Grant' :
+                             cit.source === 'school' ? 'School' :
+                             cit.source === 'contribution' ? 'Campaign' :
+                             'Legislative'}
                           </span>
                           <h5 className="text-[10px] font-extrabold text-slate-800 truncate mt-1">
                             {cit.title}

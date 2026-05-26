@@ -25,13 +25,15 @@ import {
   Database,
   Volume2,
   Video,
-  MessageSquare
+  MessageSquare,
+  Sparkles,
+  Send
 } from 'lucide-react';
 import Link from 'next/link';
 
 type Citation = {
   id: string;
-  source: 'audit' | 'council';
+  source: 'audit' | 'council' | 'budget' | 'grant' | 'school' | 'contribution' | 'bill';
   title: string;
   url: string;
   verbatim_text_context?: string;
@@ -102,6 +104,110 @@ const getApiUrl = () => {
   return process.env.NEXT_PUBLIC_API_URL || 'https://late-ways-open.loca.lt';
 };
 
+const parseInlineMarkdown = (text: string) => {
+  if (!text) return "";
+  
+  // Split by bold markdown ** first
+  const boldParts = text.split('**');
+  let keyCount = 0;
+  
+  return boldParts.map((part, i) => {
+    const isBold = i % 2 === 1;
+    
+    // Now, parse markdown links [Link Text](url)
+    const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi;
+    const subParts: React.ReactNode[] = [];
+    let lastIndex = 0;
+    let match;
+    
+    while ((match = linkRegex.exec(part)) !== null) {
+      const matchIndex = match.index;
+      if (matchIndex > lastIndex) {
+        subParts.push(part.substring(lastIndex, matchIndex));
+      }
+      
+      subParts.push(
+        <a 
+          key={`link-${keyCount++}-${matchIndex}`}
+          href={match[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-evergreen hover:text-emerald-800 underline font-bold transition-all cursor-pointer inline-flex items-center gap-0.5"
+        >
+          {match[1]}
+          <ExternalLink className="w-2.5 h-2.5 inline-block opacity-80" />
+        </a>
+      );
+      
+      lastIndex = linkRegex.lastIndex;
+    }
+    
+    if (lastIndex < part.length) {
+      subParts.push(part.substring(lastIndex));
+    }
+    
+    if (isBold) {
+      return <strong key={`bold-${keyCount++}-${i}`} className="font-extrabold text-slate-900">{subParts}</strong>;
+    }
+    return <span key={`text-${keyCount++}-${i}`}>{subParts}</span>;
+  });
+};
+
+const renderMarkdownText = (text: string) => {
+  if (!text) return null;
+
+  // Split into paragraphs/lines
+  const lines = text.split('\n');
+  return lines.map((line, idx) => {
+    let cleanLine = line.trim();
+
+    // Check for headers
+    if (cleanLine.startsWith('### ')) {
+      return (
+        <h4 key={idx} className="font-black text-slate-800 text-xs mt-3.5 mb-1.5 block tracking-tight">
+          {parseInlineMarkdown(cleanLine.slice(4))}
+        </h4>
+      );
+    }
+    if (cleanLine.startsWith('## ')) {
+      return (
+        <h3 key={idx} className="font-black text-slate-900 text-sm mt-4 mb-2 block tracking-tight">
+          {parseInlineMarkdown(cleanLine.slice(3))}
+        </h3>
+      );
+    }
+    if (cleanLine.startsWith('# ')) {
+      return (
+        <h2 key={idx} className="font-black text-slate-950 text-base mt-4.5 mb-2 block tracking-tight">
+          {parseInlineMarkdown(cleanLine.slice(2))}
+        </h2>
+      );
+    }
+
+    // Check for bullet items (starts with * or + or - followed by space)
+    const isBullet = cleanLine.startsWith('* ') || cleanLine.startsWith('+ ') || cleanLine.startsWith('- ');
+    if (isBullet) {
+      return (
+        <div key={idx} className="flex items-start gap-1.5 pl-1.5 my-1.5 leading-relaxed text-slate-700">
+          <span className="text-slate-400 select-none mt-1 text-[8px] shrink-0">•</span>
+          <span className="flex-1 text-[11px] font-medium">{parseInlineMarkdown(cleanLine.slice(2))}</span>
+        </div>
+      );
+    }
+
+    // Default paragraph line
+    if (line.trim() === '') {
+      return <div key={idx} className="h-1.5" />;
+    }
+
+    return (
+      <p key={idx} className="mb-1.5 leading-relaxed text-[11px] font-medium text-slate-700">
+        {parseInlineMarkdown(line)}
+      </p>
+    );
+  });
+};
+
 export default function CuratePage() {
   const [code, setCode] = useState<string>('');
   const [authorized, setAuthorized] = useState<boolean>(false);
@@ -122,6 +228,19 @@ export default function CuratePage() {
   const [sources, setSources] = useState<any[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [loadingSources, setLoadingSources] = useState<boolean>(false);
+
+  // Source preview / explorer state
+  const [previewRecords, setPreviewRecords] = useState<any[]>([]);
+  const [previewColumns, setPreviewColumns] = useState<string[]>([]);
+  const [previewTotal, setPreviewTotal] = useState<number>(0);
+  const [previewPage, setPreviewPage] = useState<number>(1);
+  const [previewLimit, setPreviewLimit] = useState<number>(25);
+  const [previewSortBy, setPreviewSortBy] = useState<string | null>(null);
+  const [previewSortOrder, setPreviewSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [previewSearch, setPreviewSearch] = useState<string>('');
+  const [previewSearchInput, setPreviewSearchInput] = useState<string>('');
+  const [loadingPreview, setLoadingPreview] = useState<boolean>(false);
+  const [selectedRowDetails, setSelectedRowDetails] = useState<any | null>(null);
 
   // Entities catalog state
   const [entities, setEntities] = useState<Entity[]>([]);
@@ -172,6 +291,11 @@ export default function CuratePage() {
   const [editHook, setEditHook] = useState<string>('');
   const [editMarkdown, setEditMarkdown] = useState<string>('');
 
+  // Correlation Chat state
+  const [corrChatInput, setCorrChatInput] = useState<string>('');
+  const [corrChatMessages, setCorrChatMessages] = useState<{role: 'user' | 'model', content: string}[]>([]);
+  const [corrChatLoading, setCorrChatLoading] = useState<boolean>(false);
+
   // 1. Authorization checks on mount
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -188,6 +312,12 @@ export default function CuratePage() {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (authorized && activeTab === 'sources' && selectedSourceId) {
+      fetchSourcePreview(selectedSourceId, previewPage, previewSearch, previewSortBy, previewSortOrder);
+    }
+  }, [selectedSourceId, previewPage, previewSearch, previewSortBy, previewSortOrder, previewLimit, activeTab, authorized]);
 
   const verifyCodeAndFetch = async (inputCode: string) => {
     setLoading(true);
@@ -234,6 +364,113 @@ export default function CuratePage() {
     setEditHook(c.hook);
     setEditMarkdown(c.report_markdown);
     setIsEditing(false);
+    setCorrChatMessages([]);
+    setCorrChatInput('');
+  };
+
+  const handleSendCorrChatMessage = async (msgText?: string) => {
+    const textToSend = msgText || corrChatInput;
+    if (!textToSend.trim() || !activeCorr || corrChatLoading) return;
+    
+    // Add user message to history
+    const userMsg = { role: 'user' as const, content: textToSend };
+    const updatedMessages = [...corrChatMessages, userMsg];
+    setCorrChatMessages(updatedMessages);
+    setCorrChatInput('');
+    setCorrChatLoading(true);
+    
+    // Add an empty assistant message that we will stream into
+    setCorrChatMessages(prev => [...prev, { role: 'model', content: '' }]);
+    
+    try {
+      // Use active state values (edited values) if the user is in editing mode
+      const payload = {
+        title: isEditing ? editTitle : activeCorr.title,
+        hook: isEditing ? editHook : activeCorr.hook,
+        report_markdown: isEditing ? editMarkdown : activeCorr.report_markdown,
+        citations: activeCorr.citations,
+        message: textToSend,
+        history: corrChatMessages // Send current history
+      };
+      
+      const response = await fetch(`${getApiUrl()}/api/v1/correlations/chat?code=${code}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Chat request failed with status ${response.status}`);
+      }
+      
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error("Failed to read response body stream.");
+      }
+      
+      const decoder = new TextDecoder();
+      let buffer = '';
+      
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        
+        // Save the last partial line back to the buffer
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            try {
+              const parsed = JSON.parse(trimmed.slice(5).trim());
+              if (parsed.chunk) {
+                // Append chunk to the last assistant message (pure state update)
+                setCorrChatMessages(prev => {
+                  if (prev.length === 0) return prev;
+                  const lastIndex = prev.length - 1;
+                  const last = prev[lastIndex];
+                  if (last.role === 'model') {
+                    return [
+                      ...prev.slice(0, lastIndex),
+                      { ...last, content: last.content + parsed.chunk }
+                    ];
+                  }
+                  return prev;
+                });
+              } else if (parsed.error) {
+                setCorrChatMessages(prev => {
+                  if (prev.length === 0) return prev;
+                  const lastIndex = prev.length - 1;
+                  const last = prev[lastIndex];
+                  return [
+                    ...prev.slice(0, lastIndex),
+                    { ...last, content: `Error: ${parsed.error}` }
+                  ];
+                });
+              }
+            } catch (e) {
+              console.error("Failed to parse SSE line:", e);
+            }
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error("Chat error:", error);
+      setCorrChatMessages(prev => {
+        if (prev.length === 0) return prev;
+        const lastIndex = prev.length - 1;
+        const last = prev[lastIndex];
+        return [
+          ...prev.slice(0, lastIndex),
+          { ...last, content: `Connection error: ${error.message || error}` }
+        ];
+      });
+    } finally {
+      setCorrChatLoading(false);
+    }
   };
 
   const selectEntity = (e: Entity) => {
@@ -399,6 +636,35 @@ export default function CuratePage() {
       console.error("Failed to fetch database sources:", e);
     } finally {
       setLoadingSources(false);
+    }
+  };
+
+  const fetchSourcePreview = async (sourceId: string, page: number, searchVal: string, sortBy?: string | null, sortOrder?: string) => {
+    const activeCode = code;
+    if (!activeCode || !sourceId) return;
+    setLoadingPreview(true);
+    try {
+      const offset = (page - 1) * previewLimit;
+      let url = `${getApiUrl()}/api/v1/admin/sources/${sourceId}/preview?code=${activeCode}&limit=${previewLimit}&offset=${offset}`;
+      if (searchVal) {
+        url += `&search=${encodeURIComponent(searchVal)}`;
+      }
+      if (sortBy) {
+        url += `&sort_by=${encodeURIComponent(sortBy)}&sort_order=${encodeURIComponent(sortOrder || 'desc')}`;
+      }
+      const res = await fetch(url);
+      if (res.ok) {
+        const result = await res.json();
+        if (result.status === 'success') {
+          setPreviewColumns(result.columns || []);
+          setPreviewRecords(result.data || []);
+          setPreviewTotal(result.total || 0);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to fetch source preview:", e);
+    } finally {
+      setLoadingPreview(false);
     }
   };
 
@@ -1004,7 +1270,14 @@ export default function CuratePage() {
                 sources.map(src => (
                   <button
                     key={src.id}
-                    onClick={() => setSelectedSourceId(src.id)}
+                    onClick={() => {
+                      setSelectedSourceId(src.id);
+                      setPreviewPage(1);
+                      setPreviewSearch('');
+                      setPreviewSearchInput('');
+                      setPreviewSortBy(null);
+                      setPreviewSortOrder('desc');
+                    }}
                     className={`w-full text-left p-3.5 rounded-2xl border text-xs leading-relaxed transition-all flex flex-col gap-2 group relative overflow-hidden ${
                       src.id === selectedSourceId 
                         ? 'bg-slate-100/80 border-slate-300/80 font-bold shadow-sm' 
@@ -1037,176 +1310,311 @@ export default function CuratePage() {
         <main className="flex-1 overflow-y-auto p-8 custom-scrollbar bg-slate-50/40">
           {activeTab === 'correlations' ? (
             activeCorr ? (
-              <div className="max-w-3xl mx-auto space-y-6">
+              <div className="max-w-[1380px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                 
-                {/* Toolbar Actions Card */}
-                <div className="p-4 rounded-3xl bg-white border border-slate-200/80 flex items-center justify-between shadow-sm relative overflow-hidden shrink-0">
-                  <div className="flex items-center gap-2">
-                    <span className={`text-[9px] font-black tracking-widest uppercase px-2 py-0.5 rounded border ${
-                      activeCorr.status === 'approved' 
-                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
-                        : 'bg-amber-50 text-amber-700 border-amber-200'
-                    }`}>
-                      {activeCorr.status} draft
-                    </span>
-                  </div>
+                {/* Left Columns: Toolbar, Editor, Citations */}
+                <div className="lg:col-span-7 space-y-6">
                   
-                  <div className="flex items-center gap-2">
-                    {isEditing ? (
-                      <>
-                        <button 
-                          onClick={() => handleSaveChanges(activeCorr.id)}
-                          disabled={actionLoading !== null}
-                          className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50"
-                        >
-                          <Save className="w-3.5 h-3.5" />
-                          <span>Save Changes</span>
-                        </button>
-                        <button 
-                          onClick={() => setIsEditing(false)}
-                          className="px-3.5 py-2 border border-slate-200 hover:bg-slate-50 text-slate-500 rounded-xl text-xs font-bold transition-colors cursor-pointer"
-                        >
-                          Cancel
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button 
-                          onClick={() => setIsEditing(true)}
-                          className="flex items-center gap-1.5 px-3.5 py-2 border border-slate-200 hover:bg-slate-50 text-slate-666 rounded-xl text-xs font-bold transition-colors cursor-pointer"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                          <span>Edit Content</span>
-                        </button>
-                        
-                        {activeCorr.status !== 'approved' && (
+                  {/* Toolbar Actions Card */}
+                  <div className="p-4 rounded-3xl bg-white border border-slate-200/80 flex items-center justify-between shadow-sm relative overflow-hidden shrink-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-[9px] font-black tracking-widest uppercase px-2 py-0.5 rounded border ${
+                        activeCorr.status === 'approved' 
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
+                          : 'bg-amber-50 text-amber-700 border-amber-200'
+                      }`}>
+                        {activeCorr.status} draft
+                      </span>
+                    </div>
+                    
+                    <div className="flex items-center gap-2">
+                      {isEditing ? (
+                        <>
                           <button 
-                            onClick={() => handleApprove(activeCorr.id)}
+                            onClick={() => handleSaveChanges(activeCorr.id)}
                             disabled={actionLoading !== null}
-                            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50 shadow-emerald-600/10"
+                            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50"
                           >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Approve & Publish</span>
+                            <Save className="w-3.5 h-3.5" />
+                            <span>Save Changes</span>
                           </button>
-                        )}
-                        
-                        <button 
-                          onClick={() => handleDismiss(activeCorr.id)}
-                          disabled={actionLoading !== null}
-                          className="flex items-center gap-1.5 px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-150 rounded-xl text-xs font-bold transition-colors cursor-pointer disabled:opacity-50"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                          <span>Dismiss</span>
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                {/* Editor Workspace */}
-                <div className="bg-white border border-slate-200/80 rounded-3xl p-6 md:p-8 space-y-6 shadow-sm">
-                  {isEditing ? (
-                    <div className="space-y-4">
-                      <div>
-                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Headline Title</label>
-                        <input 
-                          type="text"
-                          className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-sm font-semibold transition-all"
-                          value={editTitle}
-                          onChange={e => setEditTitle(e.target.value)}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Teaser Hook</label>
-                        <textarea 
-                          rows={2}
-                          className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-sm font-semibold transition-all resize-none"
-                          value={editHook}
-                          onChange={e => setEditHook(e.target.value)}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Report Report Markdown</label>
-                        <textarea 
-                          rows={12}
-                          className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-xs font-mono transition-all"
-                          value={editMarkdown}
-                          onChange={e => setEditMarkdown(e.target.value)}
-                        />
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-6">
-                      <div>
-                        <h2 className="text-xl md:text-2xl font-black text-slate-900 tracking-tight leading-tight">
-                          {activeCorr.title}
-                        </h2>
-                        <p className="text-xs md:text-sm text-slate-500 font-medium mt-3 leading-relaxed border-l-2 border-emerald-500/60 pl-3.5 italic bg-slate-50/50 py-1 rounded-r-lg">
-                          "{activeCorr.hook}"
-                        </p>
-                      </div>
-                      
-                      <div className="prose prose-sm prose-slate max-w-none pt-4 border-t border-slate-100 text-xs md:text-sm leading-relaxed text-slate-700 font-medium space-y-4 whitespace-pre-wrap">
-                        {activeCorr.report_markdown}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Citations Reference Drawer */}
-                <div className="bg-white border border-slate-200/80 rounded-3xl p-6 shadow-sm space-y-4">
-                  <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider pl-0.5">
-                    Identified Citations & Verbatim Context Audit ({activeCorr.citations.length})
-                  </h3>
-                  
-                  <div className="space-y-4.5">
-                    {activeCorr.citations.map((cit, cIdx) => (
-                      <div 
-                        key={cIdx}
-                        className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/60 hover:bg-slate-50 transition-colors group space-y-3"
-                      >
-                        <div className="flex items-start justify-between">
-                          <div className="min-w-0 pr-2">
-                            <span className={`text-[7px] font-black uppercase px-1.5 py-0.2 rounded border ${
-                              cit.source === 'audit' 
-                                ? 'bg-purple-50 text-purple-700 border-purple-200' 
-                                : 'bg-blue-50 text-blue-700 border-blue-200'
-                            }`}>
-                              {cit.source === 'audit' ? 'Audit ID: ' + cit.id : 'Council Action: ' + cit.id}
-                            </span>
-                            <span className="text-[7px] font-black uppercase px-1.5 py-0.2 rounded border bg-slate-100 text-slate-600 border-slate-200 ml-1.5">
-                              {cit.meeting_type || 'Unknown'}
-                            </span>
-                            <span className="text-[7px] font-black uppercase px-1.5 py-0.2 rounded border bg-emerald-50 text-emerald-700 border-emerald-250 ml-1.5">
-                              Score: {cit.verification_score !== undefined ? (cit.verification_score * 100).toFixed(0) + '%' : '100%'}
-                            </span>
-                            <h4 className="text-[11px] font-extrabold text-slate-800 truncate mt-1">
-                              {cit.title}
-                            </h4>
-                          </div>
+                          <button 
+                            onClick={() => setIsEditing(false)}
+                            className="px-3.5 py-2 border border-slate-200 hover:bg-slate-50 text-slate-500 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button 
+                            onClick={() => setIsEditing(true)}
+                            className="flex items-center gap-1.5 px-3.5 py-2 border border-slate-200 hover:bg-slate-50 text-slate-666 rounded-xl text-xs font-bold transition-colors cursor-pointer"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                            <span>Edit Content</span>
+                          </button>
                           
-                          {cit.url && (
-                            <a 
-                              href={cit.url} 
-                              target="_blank" 
-                              rel="noopener noreferrer"
-                              className="w-7 h-7 rounded-lg border border-slate-200 bg-white flex items-center justify-center shrink-0 text-slate-400 group-hover:text-evergreen group-hover:border-evergreen/30 transition-colors cursor-pointer"
+                          {activeCorr.status !== 'approved' && (
+                            <button 
+                              onClick={() => handleApprove(activeCorr.id)}
+                              disabled={actionLoading !== null}
+                              className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50 shadow-emerald-600/10"
                             >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                            </a>
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Approve & Publish</span>
+                            </button>
                           )}
-                        </div>
+                          
+                          <button 
+                            onClick={() => handleDismiss(activeCorr.id)}
+                            disabled={actionLoading !== null}
+                            className="flex items-center gap-1.5 px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-150 rounded-xl text-xs font-bold transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Dismiss</span>
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
 
-                        {/* Verbatim Context Snippet Box */}
-                        <div className="p-3 bg-amber-50/30 border border-amber-100 rounded-xl space-y-1">
-                          <span className="block text-[8px] font-black text-amber-600 uppercase tracking-widest pl-0.5">Verbatim Audit Trail context:</span>
-                          <p className="text-[10px] text-slate-650 leading-relaxed font-semibold italic">
-                            "{cit.verbatim_text_context || 'No verbatim context captured during sync.'}"
+                  {/* Editor Workspace */}
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-6 md:p-8 space-y-6 shadow-sm">
+                    {isEditing ? (
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Headline Title</label>
+                          <input 
+                            type="text"
+                            className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-sm font-semibold transition-all"
+                            value={editTitle}
+                            onChange={e => setEditTitle(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Teaser Hook</label>
+                          <textarea 
+                            rows={2}
+                            className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-sm font-semibold transition-all resize-none"
+                            value={editHook}
+                            onChange={e => setEditHook(e.target.value)}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 pl-0.5">Report Report Markdown</label>
+                          <textarea 
+                            rows={12}
+                            className="w-full px-4.5 py-3 border border-slate-200 bg-slate-50 text-slate-900 outline-none rounded-xl focus:border-evergreen focus:bg-white text-xs font-mono transition-all"
+                            value={editMarkdown}
+                            onChange={e => setEditMarkdown(e.target.value)}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-6">
+                        <div>
+                          <h2 className="text-xl md:text-2xl font-black text-slate-900 tracking-tight leading-tight">
+                            {activeCorr.title}
+                          </h2>
+                          <p className="text-xs md:text-sm text-slate-500 font-medium mt-3 leading-relaxed border-l-2 border-emerald-500/60 pl-3.5 italic bg-slate-50/50 py-1 rounded-r-lg">
+                            "{activeCorr.hook}"
                           </p>
                         </div>
+                        
+                        <div className="prose prose-sm prose-slate max-w-none pt-4 border-t border-slate-100 text-xs md:text-sm leading-relaxed text-slate-700 font-medium space-y-4">
+                          {renderMarkdownText(activeCorr.report_markdown)}
+                        </div>
                       </div>
-                    ))}
+                    )}
                   </div>
+
+                  {/* Citations Reference Drawer */}
+                  <div className="bg-white border border-slate-200/80 rounded-3xl p-6 shadow-sm space-y-4">
+                    <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider pl-0.5">
+                      Identified Citations & Verbatim Context Audit ({activeCorr.citations.length})
+                    </h3>
+                    
+                    <div className="space-y-4.5">
+                      {activeCorr.citations.map((cit, cIdx) => (
+                        <div 
+                          key={cIdx}
+                          className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/60 hover:bg-slate-50 transition-colors group space-y-3"
+                        >
+                          <div className="flex items-start justify-between">
+                            <div className="min-w-0 pr-2">
+                              <span className={`text-[7px] font-black uppercase px-1.5 py-0.2 rounded border ${
+                                cit.source === 'audit' ? 'bg-purple-50 text-purple-700 border-purple-200' :
+                                cit.source === 'council' ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                                cit.source === 'budget' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                                cit.source === 'grant' ? 'bg-amber-50 text-amber-700 border-amber-250' :
+                                cit.source === 'school' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
+                                cit.source === 'contribution' ? 'bg-rose-50 text-rose-700 border-rose-200' :
+                                'bg-teal-50 text-teal-700 border-teal-200'
+                              }`}>
+                                {cit.source === 'audit' ? 'Audit ID: ' + cit.id :
+                                 cit.source === 'council' ? 'Council Event: ' + cit.id :
+                                 cit.source === 'budget' ? 'Budget: ' + cit.id :
+                                 cit.source === 'grant' ? 'Grant ID: ' + cit.id :
+                                 cit.source === 'school' ? 'School Dist: ' + cit.id :
+                                 cit.source === 'contribution' ? 'Contribution ID: ' + cit.id :
+                                 'Legislative Bill: ' + cit.id}
+                              </span>
+                              <span className="text-[7px] font-black uppercase px-1.5 py-0.2 rounded border bg-slate-100 text-slate-600 border-slate-200 ml-1.5">
+                                {cit.meeting_type || 'Unknown'}
+                              </span>
+                              <span className="text-[7px] font-black uppercase px-1.5 py-0.2 rounded border bg-emerald-50 text-emerald-700 border-emerald-250 ml-1.5">
+                                Score: {cit.verification_score !== undefined ? (cit.verification_score * 100).toFixed(0) + '%' : '100%'}
+                              </span>
+                              <h4 className="text-[11px] font-extrabold text-slate-800 truncate mt-1">
+                                {cit.title}
+                              </h4>
+                            </div>
+                            
+                            {cit.url && (
+                              <a 
+                                href={cit.url} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="w-7 h-7 rounded-lg border border-slate-200 bg-white flex items-center justify-center shrink-0 text-slate-400 group-hover:text-evergreen group-hover:border-evergreen/30 transition-colors cursor-pointer"
+                              >
+                                <ExternalLink className="w-3.5 h-3.5" />
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Verbatim Context Snippet Box */}
+                          <div className="p-3 bg-amber-50/30 border border-amber-100 rounded-xl space-y-1">
+                            <span className="block text-[8px] font-black text-amber-600 uppercase tracking-widest pl-0.5">Verbatim Audit Trail context:</span>
+                            <p className="text-[10px] text-slate-650 leading-relaxed font-semibold italic">
+                              "{cit.verbatim_text_context || 'No verbatim context captured during sync.'}"
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                </div>
+
+                {/* Right Column: Gemini Chat Assistant Panel */}
+                <div className="lg:col-span-5 bg-white border border-slate-200/80 rounded-3xl p-5 shadow-sm space-y-4 sticky top-6 max-h-[85vh] flex flex-col overflow-hidden">
+                  
+                  {/* Header */}
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-100 shrink-0">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-emerald-50 border border-emerald-100 flex items-center justify-center text-emerald-650">
+                        <Sparkles className="w-4 h-4 text-emerald-650 animate-pulse" />
+                      </div>
+                      <div>
+                        <h4 className="font-extrabold text-xs text-slate-900 tracking-tight">Gemini Draft Assistant</h4>
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Interrogate & Refine</p>
+                      </div>
+                    </div>
+                    {corrChatMessages.length > 0 && (
+                      <button 
+                        onClick={() => setCorrChatMessages([])}
+                        className="text-[10px] text-slate-400 hover:text-slate-600 font-bold cursor-pointer transition-colors"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Messages list */}
+                  <div className="flex-1 overflow-y-auto space-y-3 pr-1 custom-scrollbar text-xs min-h-[150px]">
+                    {corrChatMessages.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center text-center py-10 space-y-2 text-slate-400 h-full">
+                        <MessageSquare className="w-8 h-8 text-slate-300" />
+                        <div>
+                          <span className="font-bold text-slate-600 text-xs block">Interrogate Draft</span>
+                          <span className="text-[10px] max-w-[200px] leading-relaxed block mt-1 mx-auto text-slate-400">
+                            Ask Gemini to rewrite sections, check citations, draft alternative titles, or fact-check audit details.
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      corrChatMessages.map((msg, mIdx) => (
+                        <div 
+                          key={mIdx}
+                          className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
+                        >
+                          <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest pl-1.5 pb-0.5 select-none">
+                            {msg.role === 'user' ? 'Publisher' : 'Gemini'}
+                          </span>
+                          <div 
+                            className={`p-3 rounded-2xl max-w-[95%] leading-relaxed ${
+                              msg.role === 'user' 
+                                ? 'bg-evergreen text-white font-semibold shadow-sm rounded-tr-sm whitespace-pre-wrap' 
+                                : 'bg-slate-50 border border-slate-200 text-slate-700 rounded-tl-sm shadow-inner'
+                            }`}
+                          >
+                            {msg.content ? (
+                              msg.role === 'user' ? (
+                                msg.content
+                              ) : (
+                                <div className="space-y-0.5">
+                                  {renderMarkdownText(msg.content)}
+                                </div>
+                              )
+                            ) : (
+                              <span className="flex items-center gap-1.5 text-slate-450">
+                                <RefreshCw className="w-3 h-3 animate-spin" />
+                                Thinking...
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Suggestion Chips */}
+                  <div className="space-y-1.5 shrink-0 pt-2 border-t border-slate-100">
+                    <span className="block text-[8px] font-black text-slate-400 uppercase tracking-widest pl-0.5">Quick Actions</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        { text: "🔍 Fact-check citations", prompt: "Fact check the report markdown against the verbatim audit contexts. Do we have any unsupported claims?" },
+                        { text: "Hook ✍️ Improve hook", prompt: "Suggest 3 alternative punchy and engaging teaser hooks for this correlation." },
+                        { text: "Title 💡 Rewrite title", prompt: "Suggest 3 alternative headlines that are clear, informative, and engaging." },
+                        { text: "Verify 📊 Verify dollars", prompt: "Double check all dollar values mentioned in the report. Do they match the database citations exactly?" }
+                      ].map((chip, cIdx) => (
+                        <button
+                          key={cIdx}
+                          onClick={() => handleSendCorrChatMessage(chip.prompt)}
+                          disabled={corrChatLoading}
+                          className="px-2 py-0.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 hover:border-slate-350 text-[10px] text-slate-600 hover:text-slate-800 font-bold rounded-lg transition-all cursor-pointer disabled:opacity-50"
+                        >
+                          {chip.text}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Input Form */}
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleSendCorrChatMessage();
+                    }}
+                    className="flex items-center gap-2 border border-slate-200 bg-slate-50/80 focus-within:bg-white focus-within:border-evergreen rounded-2xl p-1.5 transition-all shrink-0 shadow-inner"
+                  >
+                    <input
+                      type="text"
+                      placeholder="Ask Gemini about this draft..."
+                      className="flex-1 bg-transparent px-3 py-1.5 text-xs font-semibold outline-none text-slate-800"
+                      value={corrChatInput}
+                      onChange={(e) => setCorrChatInput(e.target.value)}
+                      disabled={corrChatLoading}
+                    />
+                    <button
+                      type="submit"
+                      disabled={corrChatLoading || !corrChatInput.trim()}
+                      className="w-8 h-8 rounded-xl bg-evergreen hover:bg-emerald-700 text-white flex items-center justify-center transition-all cursor-pointer disabled:opacity-40"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </form>
                 </div>
 
               </div>
@@ -2053,7 +2461,7 @@ export default function CuratePage() {
             )
           ) : (
             activeSource ? (
-              <div className="max-w-3xl mx-auto space-y-6">
+              <div className="max-w-6xl mx-auto space-y-6 w-full">
                 
                 {/* Header info card */}
                 <div className="p-4 rounded-3xl bg-white border border-slate-200/80 flex items-center justify-between shadow-sm relative overflow-hidden shrink-0">
@@ -2120,6 +2528,197 @@ export default function CuratePage() {
                     </p>
                   </div>
                 </div>
+
+                {/* Records Preview Card */}
+                <div className="bg-white border border-slate-200/80 rounded-3xl p-6 md:p-8 space-y-6 shadow-sm">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                      <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider pl-0.5 flex items-center gap-1.5">
+                        <Database className="w-4 h-4 text-amber-500" />
+                        <span>Database Record Explorer</span>
+                      </h3>
+                      <p className="text-[10px] text-slate-400 font-medium">
+                        Showing sample records from the table. Click any row to inspect all columns.
+                      </p>
+                    </div>
+                    
+                    {/* Search form */}
+                    <form 
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        setPreviewSearch(previewSearchInput);
+                        setPreviewPage(1);
+                      }}
+                      className="flex items-center gap-2 max-w-sm w-full"
+                    >
+                      <input 
+                        type="text"
+                        placeholder="Search records..."
+                        className="w-full px-3.5 py-1.5 border border-slate-200 bg-slate-50 text-xs rounded-xl focus:bg-white focus:border-evergreen outline-none font-medium"
+                        value={previewSearchInput}
+                        onChange={(e) => setPreviewSearchInput(e.target.value)}
+                      />
+                      <button 
+                        type="submit"
+                        className="px-3.5 py-1.5 bg-evergreen hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shrink-0 shadow-sm cursor-pointer"
+                      >
+                        Search
+                      </button>
+                      {previewSearch && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPreviewSearchInput('');
+                            setPreviewSearch('');
+                            setPreviewPage(1);
+                          }}
+                          className="px-2.5 py-1.5 border border-slate-200 hover:bg-slate-100 text-slate-500 rounded-xl text-xs font-bold transition-all shrink-0 cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </form>
+                  </div>
+
+                  {loadingPreview ? (
+                    <div className="flex flex-col items-center justify-center py-16 space-y-2 text-slate-400">
+                      <RefreshCw className="w-8 h-8 animate-spin text-amber-500" />
+                      <span className="text-xs font-bold">Querying source records...</span>
+                    </div>
+                  ) : previewRecords.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-16 space-y-1 text-slate-400 border border-dashed border-slate-200 rounded-2xl bg-slate-50/50">
+                      <Database className="w-8 h-8 text-slate-350" />
+                      <span className="text-xs font-bold text-slate-600">No records found</span>
+                      <span className="text-[10px]">Try adjusting your search filter or checking database logs.</span>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {/* Responsive Grid/Table container */}
+                      <div className="max-h-[500px] overflow-y-auto overflow-x-auto border border-slate-200/80 rounded-2xl bg-white shadow-inner max-w-full custom-scrollbar">
+                        <table className="min-w-full divide-y divide-slate-100 text-left text-xs whitespace-nowrap">
+                          <thead className="bg-slate-50 text-slate-450 font-bold uppercase tracking-wider text-[9px] border-b border-slate-150 sticky top-0 z-10 shadow-sm">
+                            <tr>
+                              <th className="px-4 py-3 text-center bg-slate-50 sticky left-0 z-20 shadow-[2px_0_5px_rgba(0,0,0,0.05)] border-r border-slate-200">Action</th>
+                              {previewColumns.map((col) => {
+                                const isSorted = previewSortBy === col;
+                                return (
+                                  <th 
+                                    key={col} 
+                                    className="px-4 py-3 cursor-pointer hover:bg-slate-100 hover:text-slate-700 transition-colors select-none group bg-slate-50"
+                                    onClick={() => {
+                                      if (previewSortBy === col) {
+                                        setPreviewSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
+                                      } else {
+                                        setPreviewSortBy(col);
+                                        setPreviewSortOrder('desc');
+                                      }
+                                      setPreviewPage(1);
+                                    }}
+                                  >
+                                    <div className="flex items-center gap-1.5 justify-between">
+                                      <span>{col}</span>
+                                      <span className={`text-[10px] ${isSorted ? 'text-amber-600 font-black' : 'text-slate-300 group-hover:text-slate-400'}`}>
+                                        {isSorted ? (previewSortOrder === 'asc' ? '▲' : '▼') : '↕'}
+                                      </span>
+                                    </div>
+                                  </th>
+                                );
+                              })}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-slate-700">
+                            {previewRecords.map((row, rIdx) => (
+                              <tr 
+                                key={rIdx} 
+                                className="hover:bg-amber-50/20 cursor-pointer transition-colors group"
+                                onClick={() => setSelectedRowDetails(row)}
+                              >
+                                <td className="px-4 py-2.5 text-center bg-white group-hover:bg-slate-50 sticky left-0 z-10 shadow-[2px_0_5px_rgba(0,0,0,0.05)] border-r border-slate-200 transition-colors">
+                                  <button 
+                                    className="px-2.5 py-1 bg-amber-50 hover:bg-amber-100 border border-amber-250 text-amber-800 text-[10px] font-bold rounded-lg transition-all"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSelectedRowDetails(row);
+                                    }}
+                                  >
+                                    Inspect
+                                  </button>
+                                </td>
+                                {previewColumns.map((col) => {
+                                  const val = row[col];
+                                  let displayVal = val === null || val === undefined ? (
+                                    <span className="text-slate-355 italic font-medium">NULL</span>
+                                  ) : typeof val === 'object' ? (
+                                    JSON.stringify(val)
+                                  ) : String(val);
+ 
+                                  // Truncate long strings for tabular view
+                                  if (typeof displayVal === 'string' && displayVal.length > 45) {
+                                    displayVal = displayVal.substring(0, 45) + '...';
+                                  }
+ 
+                                  return (
+                                    <td key={col} className="px-4 py-2.5 max-w-[250px] truncate font-medium text-slate-800">
+                                      {displayVal}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+ 
+                      {/* Pagination Controls */}
+                      <div className="flex flex-col sm:flex-row items-center justify-between border-t border-slate-100 pt-4 gap-4 text-xs font-semibold text-slate-500">
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                          <div>
+                            Showing <span className="text-slate-800 font-bold">{Math.min(previewTotal, (previewPage - 1) * previewLimit + 1)}</span> to{' '}
+                            <span className="text-slate-800 font-bold">{Math.min(previewTotal, previewPage * previewLimit)}</span> of{' '}
+                            <span className="text-slate-800 font-bold">{previewTotal.toLocaleString()}</span> records
+                          </div>
+                          
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">Rows:</span>
+                            <select
+                              value={previewLimit}
+                              onChange={(e) => {
+                                setPreviewLimit(Number(e.target.value));
+                                setPreviewPage(1);
+                              }}
+                              className="px-2.5 py-1 border border-slate-200 bg-white hover:border-slate-300 rounded-lg text-xs outline-none focus:border-evergreen cursor-pointer font-bold text-slate-700 transition-colors shadow-sm"
+                            >
+                              {[15, 25, 50, 100, 250, 500].map(sz => (
+                                <option key={sz} value={sz}>{sz}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={previewPage <= 1}
+                            onClick={() => setPreviewPage(prev => Math.max(1, prev - 1))}
+                            className="px-3.5 py-1.5 border border-slate-200 hover:bg-slate-100 text-slate-500 rounded-xl text-xs font-bold transition-all disabled:opacity-40 disabled:hover:bg-transparent cursor-pointer"
+                          >
+                            Prev
+                          </button>
+                          <span className="text-slate-850 px-2 font-bold">Page {previewPage} of {Math.max(1, Math.ceil(previewTotal / previewLimit))}</span>
+                          <button
+                            type="button"
+                            disabled={previewPage >= Math.ceil(previewTotal / previewLimit)}
+                            onClick={() => setPreviewPage(prev => prev + 1)}
+                            className="px-3.5 py-1.5 border border-slate-200 hover:bg-slate-100 text-slate-500 rounded-xl text-xs font-bold transition-all disabled:opacity-40 disabled:hover:bg-transparent cursor-pointer"
+                          >
+                            Next
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center text-center py-36 px-4 text-slate-400 space-y-3">
@@ -2136,6 +2735,69 @@ export default function CuratePage() {
         </main>
 
       </div>
+
+      {/* Dynamic Row Detail Modal */}
+      {selectedRowDetails && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white border border-slate-200 rounded-3xl max-w-2xl w-full max-h-[85vh] shadow-2xl flex flex-col overflow-hidden">
+            
+            {/* Modal Header */}
+            <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50 shrink-0">
+              <div className="flex items-center gap-2">
+                <Database className="w-5 h-5 text-amber-500" />
+                <div>
+                  <h3 className="font-extrabold text-sm text-slate-900 tracking-tight">Record Inspection</h3>
+                  <p className="text-[10px] text-slate-400 font-medium">Full column value mapping for the selected row.</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setSelectedRowDetails(null)}
+                className="w-8 h-8 rounded-full border border-slate-200 hover:bg-slate-100 text-slate-500 hover:text-slate-800 transition-colors flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-4 text-xs flex-1 custom-scrollbar">
+              <div className="border border-slate-150 rounded-2xl overflow-hidden bg-slate-50/30">
+                <table className="min-w-full divide-y divide-slate-100 text-left">
+                  <tbody>
+                    {Object.entries(selectedRowDetails).map(([col, val]) => (
+                      <tr key={col} className="hover:bg-slate-50 transition-colors">
+                        <td className="px-4 py-3 font-bold text-slate-400 uppercase tracking-wider w-1/3 border-r border-slate-100 font-mono text-[10px]">
+                          {col}
+                        </td>
+                        <td className="px-4 py-3 text-slate-800 font-medium font-mono text-[11px] whitespace-pre-wrap break-all select-all selection:bg-amber-100">
+                          {val === null || val === undefined ? (
+                            <span className="text-slate-350 italic font-semibold">NULL</span>
+                          ) : typeof val === 'object' ? (
+                            JSON.stringify(val, null, 2)
+                          ) : (
+                            String(val)
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 border-t border-slate-100 bg-slate-50/50 flex justify-end shrink-0">
+              <button 
+                onClick={() => setSelectedRowDetails(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm"
+              >
+                Close Inspector
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

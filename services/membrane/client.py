@@ -48,7 +48,7 @@ class MembraneClient:
                 response.raise_for_status()
                 return self._stream_generator(response)
             else:
-                response = requests.post(url, headers=self._headers(), json=payload, timeout=60)
+                response = requests.post(url, headers=self._headers(), json=payload, timeout=120)
                 response.raise_for_status()
                 return response.json()
         except requests.exceptions.RequestException as e:

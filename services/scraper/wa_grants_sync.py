@@ -165,8 +165,8 @@ def sync_grants():
         start_date = f"{year}-01-01"
         end_date = f"{year}-12-31"
         
-        # Fetch the top 3 pages (300 records) of grant awards in WA for each year
-        for page in range(1, 4):
+        # Fetch the top 5 pages (500 records) of grant awards in WA for each year
+        for page in range(1, 6):
             payload = {
                 "filters": {
                     "time_period": [
@@ -175,7 +175,8 @@ def sync_grants():
                     "recipient_locations": [
                         {"country": "USA", "state": "WA"}
                     ],
-                    "award_type_codes": ["02", "03", "04", "05"]
+                    "award_type_codes": ["02", "03", "04", "05"],
+                    "recipient_type_names": ["local_government"]
                 },
                 "fields": [
                     "Award ID",

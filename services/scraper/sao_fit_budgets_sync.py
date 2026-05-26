@@ -132,15 +132,15 @@ def sync_fit_budgets():
     pg_cur = pg_conn.cursor() if pg_conn else None
     sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
     
-    # Truncate tables first
-    print("  Truncating budgets and budget_items tables...")
+    # Clean up existing County Road data only
+    print("  Cleaning up existing County Road data...")
     if sqlite_cur:
-        sqlite_cur.execute("DELETE FROM budget_items")
-        sqlite_cur.execute("DELETE FROM budgets")
+        sqlite_cur.execute("DELETE FROM budget_items WHERE description LIKE 'County Road %'")
+        sqlite_cur.execute("DELETE FROM budgets WHERE source_url LIKE '%data.wa.gov%'")
         sqlite_conn.commit()
     if pg_cur:
-        pg_cur.execute("DELETE FROM budget_items")
-        pg_cur.execute("DELETE FROM budgets")
+        pg_cur.execute("DELETE FROM budget_items WHERE description LIKE 'County Road %'")
+        pg_cur.execute("DELETE FROM budgets WHERE source_url LIKE '%data.wa.gov%'")
         pg_conn.commit()
 
     saved_budget_count = 0
@@ -194,39 +194,55 @@ def sync_fit_budgets():
         budget_id = None
         source_url = f"https://data.wa.gov/resource/bxeh-ranj.json?countyname={county_disp}"
         
-        # SQLite Budget Parent Insert
+        # SQLite Budget Parent Insert/Update
+        sqlite_budget_id = None
         if sqlite_conn and sqlite_cur:
             try:
                 sqlite_cur.execute(
-                    """
-                    INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
-                    VALUES (?, 'county', ?, ?, ?, 0.0, 0.0, ?)
-                    """,
-                    (std_name, year, total_rev, total_exp, source_url)
+                    "SELECT id FROM budgets WHERE jurisdiction_name = ? AND entity_type = 'county' AND fiscal_year = ? LIMIT 1",
+                    (std_name, year)
                 )
-                sqlite_cur.execute("SELECT last_insert_rowid()")
-                sqlite_budget_id = sqlite_cur.fetchone()[0]
+                row = sqlite_cur.fetchone()
+                if row:
+                    sqlite_budget_id = row[0]
+                else:
+                    sqlite_cur.execute(
+                        """
+                        INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
+                        VALUES (?, 'county', ?, ?, ?, 0.0, 0.0, ?)
+                        """,
+                        (std_name, year, total_rev, total_exp, source_url)
+                    )
+                    sqlite_budget_id = sqlite_cur.lastrowid
+                    saved_budget_count += 1
                 if not pg_conn:
                     budget_id = sqlite_budget_id
-                    saved_budget_count += 1
             except Exception as sq_err:
-                print(f"  SQLite insert budget failed for {std_name} ({year}): {sq_err}")
+                print(f"  SQLite insert/fetch budget failed for {std_name} ({year}): {sq_err}")
                 
-        # Postgres Budget Parent Insert
+        # Postgres Budget Parent Insert/Update
         if pg_conn and pg_cur:
             try:
                 pg_cur.execute(
-                    """
-                    INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
-                    VALUES (%s, 'county', %s, %s, %s, 0.0, 0.0, %s)
-                    RETURNING id
-                    """,
-                    (std_name, year, total_rev, total_exp, source_url)
+                    "SELECT id FROM budgets WHERE jurisdiction_name = %s AND entity_type = %s AND fiscal_year = %s LIMIT 1",
+                    (std_name, "county", year)
                 )
-                budget_id = pg_cur.fetchone()[0]
-                saved_budget_count += 1
+                row = pg_cur.fetchone()
+                if row:
+                    budget_id = row[0]
+                else:
+                    pg_cur.execute(
+                        """
+                        INSERT INTO budgets (jurisdiction_name, entity_type, fiscal_year, total_revenue, total_expenditures, fund_balance_beginning, fund_balance_ending, source_url)
+                        VALUES (%s, 'county', %s, %s, %s, 0.0, 0.0, %s)
+                        RETURNING id
+                        """,
+                        (std_name, year, total_rev, total_exp, source_url)
+                    )
+                    budget_id = pg_cur.fetchone()[0]
+                    saved_budget_count += 1
             except Exception as pg_err:
-                print(f"  Postgres insert budget failed for {std_name} ({year}): {pg_err}")
+                print(f"  Postgres insert/fetch budget failed for {std_name} ({year}): {pg_err}")
                 pg_conn.rollback()
                 
         # Ingest budget_items

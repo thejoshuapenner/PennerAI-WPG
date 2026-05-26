@@ -61,41 +61,68 @@ def load_jurisdictions(conn, is_pg: bool) -> dict:
     finally:
         cur.close()
 
+PORT_ALIASES = {
+    "PORT OF COLUMBIA COUNTY": "Port of Columbia",
+    "PORT OF GARFIELD COUNTY": "Port of Garfield",
+    "PORT OF QUINCY": "Port of Grant County No. 1 (Quincy)",
+    "PORT OF MOSES LAKE": "Port of Grant County No. 10 (Moses Lake)",
+    "PORT OF ROYAL SLOPE": "Port of Grant County No. 2 (Royal Slope)",
+    "PORT OF MATTAWA": "Port of Grant County No. 3 (Mattawa)",
+    "PORT OF COULEE CITY": "Port of Grant County No. 4 (Coulee City)",
+    "PORT OF HARTLINE": "Port of Grant County No. 5 (Hartline)",
+    "PORT OF WILSON CREEK": "Port of Grant County No. 6 (Wilson Creek)",
+    "PORT OF GRAND COULEE": "Port of Grant County No. 7 (Grand Coulee)",
+    "PORT OF WARDEN": "Port of Grant County No. 8 (Warden)",
+    "PORT OF EPHRATA": "Port of Grant County No. 9 (Ephrata)",
+    "KLICKITAT COUNTY PORT DISTRICT NO. 1": "Port of Klickitat",
+    "WAHKIAKUM COUNTY PORT DISTRICT NO. 1": "Port of Wahkiakum County No. 1",
+    "WAHKIAKUM COUNTY PORT DISTRICT NO. 2": "Port of Wahkiakum County No. 2",
+    "PEND OREILLE VALLEY RAILROAD": "Port of Pend Oreille",
+}
+
 def match_jurisdiction(common_name, jurisdictions) -> tuple:
-    """Matches SAO common name to our standardized jurisdiction list."""
+    """Matches SAO common name to our standardized jurisdiction list strictly."""
     if not common_name:
         return None, None
         
-    name_up = common_name.upper().strip()
+    name_up = common_name.strip().upper()
     
-    # 1. Direct matches
+    # 1. Check for specific Port Aliases first
+    if name_up in PORT_ALIASES:
+        std_name = PORT_ALIASES[name_up]
+        std_name_up = std_name.upper()
+        if std_name_up in jurisdictions:
+            return jurisdictions[std_name_up]['std_name'], 'port'
+        return std_name, 'port'
+        
+    # 2. Check for Town of Saint John -> St. John city translation
+    if name_up == "TOWN OF SAINT JOHN" or name_up == "SAINT JOHN":
+        if "ST. JOHN" in jurisdictions:
+            return jurisdictions["ST. JOHN"]['std_name'], 'city'
+            
+    # 3. Direct matches
     if name_up in jurisdictions:
         return jurisdictions[name_up]['std_name'], jurisdictions[name_up]['entity_type']
         
-    # 2. Cleanup SAO names
-    if name_up.startswith("PORT OF "):
-        base = name_up.replace("PORT OF ", "").strip()
-        for name, info in jurisdictions.items():
-            if info['entity_type'] == 'port' and base in name:
-                return info['std_name'], 'port'
-                
-    if name_up.startswith("CITY OF ") or name_up.startswith("TOWN OF "):
-        base = name_up.replace("CITY OF ", "").replace("TOWN OF ", "").strip()
-        if base in jurisdictions:
+    # 4. Clean up Cities (strip "City of " or "Town of " from FIT name)
+    if name_up.startswith("CITY OF "):
+        base = name_up[8:].strip()
+        if base in jurisdictions and jurisdictions[base]['entity_type'] == 'city':
+            return jurisdictions[base]['std_name'], 'city'
+    elif name_up.startswith("TOWN OF "):
+        base = name_up[8:].strip()
+        if base in jurisdictions and jurisdictions[base]['entity_type'] == 'city':
             return jurisdictions[base]['std_name'], 'city'
             
+    # 5. Clean up Counties
     if name_up.endswith(" COUNTY"):
-        if name_up in jurisdictions:
+        if name_up in jurisdictions and jurisdictions[name_up]['entity_type'] == 'county':
             return jurisdictions[name_up]['std_name'], 'county'
             
-    # Substring matching fallback
-    for name, info in jurisdictions.items():
-        if name in name_up or name_up in name:
-            if info['entity_type'] == 'port' and "PORT" not in name_up:
-                continue
-            if info['entity_type'] == 'school_district' and "SCHOOL" not in name_up and "SD" not in name_up:
-                continue
-            return info['std_name'], info['entity_type']
+    # 6. Clean up Ports
+    if name_up.startswith("PORT OF "):
+        if name_up in jurisdictions and jurisdictions[name_up]['entity_type'] == 'port':
+            return jurisdictions[name_up]['std_name'], 'port'
             
     return None, None
 
@@ -300,8 +327,8 @@ def parse_and_ingest_fit_file(file_path, year):
                 sqlite_budget_id = None
                 
                 sqlite_cur.execute(
-                    "SELECT id FROM budgets WHERE jurisdiction_name = ? AND fiscal_year = ? LIMIT 1",
-                    (std_name, year)
+                    "SELECT id FROM budgets WHERE jurisdiction_name = ? AND entity_type = ? AND fiscal_year = ? LIMIT 1",
+                    (std_name, etype, year)
                 )
                 row = sqlite_cur.fetchone()
                 if row:
@@ -372,8 +399,8 @@ def parse_and_ingest_fit_file(file_path, year):
                 pg_budget_id = None
                 
                 pg_cur.execute(
-                    "SELECT id FROM budgets WHERE jurisdiction_name = %s AND fiscal_year = %s LIMIT 1",
-                    (std_name, year)
+                    "SELECT id FROM budgets WHERE jurisdiction_name = %s AND entity_type = %s AND fiscal_year = %s LIMIT 1",
+                    (std_name, etype, year)
                 )
                 row = pg_cur.fetchone()
                 if row:
@@ -434,7 +461,22 @@ def parse_and_ingest_fit_file(file_path, year):
     print(f"  [PARSER] Finished ingestion. Loaded {saved_budget_count} new budgets and {saved_item_count} breakdowns.")
 
 async def sync_general_fund_budgets(years):
+    global SQLITE_PATH
     print(f"🚀 [GENERAL FUND SYNC] Ingesting local General Fund budgets for years: {years}...")
+    
+    # Copy database locally to prevent Google Drive lock during batch inserts
+    temp_db_path = "/Users/thejoshuapenner/.gemini/antigravity/brain/a79b3e23-62f8-4a39-a5f2-fafeec1789e0/scratch/municipal_intent_temp.db"
+    import shutil
+    original_sqlite_path = SQLITE_PATH
+    
+    print(f"  [DB COPY] Copying database locally to: {temp_db_path}")
+    try:
+        shutil.copy2(original_sqlite_path, temp_db_path)
+        SQLITE_PATH = temp_db_path
+    except Exception as copy_err:
+        print(f"  [DB COPY ERROR] Local copy failed: {copy_err}. Proceeding with original path.")
+        temp_db_path = None
+
     for year in years:
         file_path = await download_sao_extract(year)
         if file_path and os.path.exists(file_path):
@@ -451,5 +493,16 @@ async def sync_general_fund_budgets(years):
         else:
             print(f"  [ERROR] Download failed for Year {year}. Skipping...")
 
+    # Copy the database back to Google Drive
+    if temp_db_path and os.path.exists(temp_db_path):
+        print(f"  [DB COPY] Copying updated database back to: {original_sqlite_path}")
+        try:
+            shutil.copy2(temp_db_path, original_sqlite_path)
+            os.remove(temp_db_path)
+        except Exception as copy_back_err:
+            print(f"  [DB COPY ERROR] Copy back failed: {copy_back_err}")
+            
+    SQLITE_PATH = original_sqlite_path
+
 if __name__ == "__main__":
-    asyncio.run(sync_general_fund_budgets([2024]))
+    asyncio.run(sync_general_fund_budgets([2022, 2023, 2024, 2025]))
