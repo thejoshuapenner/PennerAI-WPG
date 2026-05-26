@@ -101,8 +101,39 @@ const getApiUrl = () => {
       return 'http://localhost:8002';
     }
   }
-  return process.env.NEXT_PUBLIC_API_URL || 'https://late-ways-open.loca.lt';
+  return process.env.NEXT_PUBLIC_API_URL || 'https://penner-policy-api.loca.lt';
 };
+
+// Globally override fetch to automatically inject Bypass-Tunnel-Reminder header for localtunnel
+if (typeof window !== 'undefined') {
+  const win = window as any;
+  if (!win.__fetch_override_applied__) {
+    win.__fetch_override_applied__ = true;
+    const originalFetch = window.fetch;
+    window.fetch = function (input: any, init: any) {
+      let url = "";
+      if (typeof input === 'string') {
+        url = input;
+      } else if (input && typeof input === 'object' && 'url' in input) {
+        url = input.url;
+      }
+      
+      if (url && (url.includes('loca.lt') || url.includes('localhost:8002'))) {
+        init = init || {};
+        init.headers = init.headers || {};
+        if (init.headers instanceof Headers) {
+          init.headers.set('Bypass-Tunnel-Reminder', 'true');
+        } else if (Array.isArray(init.headers)) {
+          init.headers.push(['Bypass-Tunnel-Reminder', 'true']);
+        } else {
+          init.headers['Bypass-Tunnel-Reminder'] = 'true';
+        }
+      }
+      return originalFetch.call(this, input, init);
+    };
+  }
+}
+
 
 const parseInlineMarkdown = (text: string) => {
   if (!text) return "";

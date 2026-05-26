@@ -58,6 +58,47 @@ type Thread = {
   lens: 'comprehensive' | 'audits' | 'council' | 'bills' | 'grants';
 };
 
+const getApiUrl = () => {
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return 'http://localhost:8002';
+    }
+  }
+  return process.env.NEXT_PUBLIC_API_URL || 'https://penner-policy-api.loca.lt';
+};
+
+// Globally override fetch to automatically inject Bypass-Tunnel-Reminder header for localtunnel
+if (typeof window !== 'undefined') {
+  const win = window as any;
+  if (!win.__fetch_override_applied__) {
+    win.__fetch_override_applied__ = true;
+    const originalFetch = window.fetch;
+    window.fetch = function (input: any, init: any) {
+      let url = "";
+      if (typeof input === 'string') {
+        url = input;
+      } else if (input && typeof input === 'object' && 'url' in input) {
+        url = input.url;
+      }
+      
+      if (url && (url.includes('loca.lt') || url.includes('localhost:8002'))) {
+        init = init || {};
+        init.headers = init.headers || {};
+        if (init.headers instanceof Headers) {
+          init.headers.set('Bypass-Tunnel-Reminder', 'true');
+        } else if (Array.isArray(init.headers)) {
+          init.headers.push(['Bypass-Tunnel-Reminder', 'true']);
+        } else {
+          init.headers['Bypass-Tunnel-Reminder'] = 'true';
+        }
+      }
+      return originalFetch.call(this, input, init);
+    };
+  }
+}
+
+
 // Simple helper to parse and render bold markdown and citation links
 const parseInlineMarkdown = (
   text: string, 
@@ -381,7 +422,7 @@ export default function Dashboard() {
   useEffect(() => {
     const fetchSuggestions = async () => {
       try {
-        const res = await fetch("/api/v1/suggestions/home");
+        const res = await fetch(`${getApiUrl()}/api/v1/suggestions/home`);
         if (res.ok) {
           const data = await res.json();
           if (data.suggestions && data.suggestions.length > 0) {
@@ -431,7 +472,7 @@ export default function Dashboard() {
   useEffect(() => {
     const fetchHomeCorrelations = async () => {
       try {
-        const res = await fetch('/api/v1/correlations');
+        const res = await fetch(`${getApiUrl()}/api/v1/correlations`);
         if (res.ok) {
           const data = await res.json();
           setHomeCorrelations(data);
@@ -715,7 +756,7 @@ export default function Dashboard() {
         'x-session-id': sessionStorage.getItem('penner_sess_id') || 'unknown-session'
       } : {};
 
-      const response = await fetch('/api/v1/chat', {
+      const response = await fetch(`${getApiUrl()}/api/v1/chat`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -886,7 +927,7 @@ export default function Dashboard() {
         query: activeMsg?.content || ''
       };
 
-      const res = await fetch('/api/v1/auth/assign', {
+      const res = await fetch(`${getApiUrl()}/api/v1/auth/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -921,7 +962,7 @@ export default function Dashboard() {
         'x-session-id': sessionStorage.getItem('penner_sess_id') || 'unknown-session'
       } : {};
       
-      const res = await fetch('/api/v1/bugs', {
+      const res = await fetch(`${getApiUrl()}/api/v1/bugs`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',

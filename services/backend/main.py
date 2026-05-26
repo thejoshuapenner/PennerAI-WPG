@@ -148,8 +148,26 @@ def clean_summary_text(agenda_title: Optional[str], key_action: Optional[str] = 
 
     return title_str or action_str or "No description available"
 
+_postgres_available = True
+_last_postgres_check_time = 0.0
+_postgres_check_cooldown = 30.0
+
 def get_pg_conn():
-    return psycopg2.connect(POSTGRES_URL)
+    global _postgres_available, _last_postgres_check_time
+    now = time.time()
+    if not _postgres_available and (now - _last_postgres_check_time < _postgres_check_cooldown):
+        raise psycopg2.OperationalError(
+            "Postgres is down. Circuit breaker active (skipping connection attempt)."
+        )
+    try:
+        conn = psycopg2.connect(POSTGRES_URL, connect_timeout=2)
+        _postgres_available = True
+        _last_postgres_check_time = now
+        return conn
+    except Exception as e:
+        _postgres_available = False
+        _last_postgres_check_time = now
+        raise e
 
 def get_sqlite_conn(db_name: str):
     sqlite_dir = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper"
@@ -969,7 +987,7 @@ def bootstrap_sqlite_tracking(conn):
 
 def get_tracking_db_connection():
     try:
-        conn = psycopg2.connect(POSTGRES_URL)
+        conn = get_pg_conn()
         return conn, True
     except Exception:
         try:
@@ -4886,9 +4904,21 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
 
     return correlations_list
 
+_approved_correlations_cache = None
+_approved_correlations_cache_time = 0.0
+
+def clear_correlations_cache():
+    global _approved_correlations_cache
+    _approved_correlations_cache = None
+
 @app.get("/api/v1/correlations")
 async def get_approved_correlations():
     """Retrieve approved correlations for public homepage."""
+    global _approved_correlations_cache, _approved_correlations_cache_time
+    now = time.time()
+    if _approved_correlations_cache is not None and (now - _approved_correlations_cache_time < 300):
+        return _approved_correlations_cache
+
     try:
         conn = get_pg_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -4904,7 +4934,10 @@ async def get_approved_correlations():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        return enrich_correlations_with_years([dict(r) for r in rows])
+        res = enrich_correlations_with_years([dict(r) for r in rows])
+        _approved_correlations_cache = res
+        _approved_correlations_cache_time = now
+        return res
     except Exception as pg_err:
         # SQLite Fallback
         for db_name in ["sao_audits.db", "sao_2024.db", "municipal_intent.db"]:
@@ -4935,7 +4968,10 @@ async def get_approved_correlations():
                             "reviewed_at": r[7]
                         })
                     conn.close()
-                    return enrich_correlations_with_years(results)
+                    res = enrich_correlations_with_years(results)
+                    _approved_correlations_cache = res
+                    _approved_correlations_cache_time = now
+                    return res
                 except Exception:
                     pass
         return []
@@ -5045,6 +5081,7 @@ async def approve_correlation(corr_id: int, is_admin: bool = Depends(check_admin
         conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Correlation not found.")
+        clear_correlations_cache()
         return {"status": "success", "id": corr_id, "action": "approved"}
     except Exception as pg_err:
         if "Correlation not found" in str(pg_err):
@@ -5059,6 +5096,7 @@ async def approve_correlation(corr_id: int, is_admin: bool = Depends(check_admin
                     conn.commit()
                     cur.close()
                     conn.close()
+                    clear_correlations_cache()
                     return {"status": "success", "id": corr_id, "action": "approved"}
                 except Exception:
                     pass
@@ -5077,6 +5115,7 @@ async def dismiss_correlation(corr_id: int, is_admin: bool = Depends(check_admin
         conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Correlation not found.")
+        clear_correlations_cache()
         return {"status": "success", "id": corr_id, "action": "dismissed"}
     except Exception as pg_err:
         if "Correlation not found" in str(pg_err):
@@ -5091,6 +5130,7 @@ async def dismiss_correlation(corr_id: int, is_admin: bool = Depends(check_admin
                     conn.commit()
                     cur.close()
                     conn.close()
+                    clear_correlations_cache()
                     return {"status": "success", "id": corr_id, "action": "dismissed"}
                 except Exception:
                     pass
@@ -5117,6 +5157,7 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
         conn.close()
         if not row:
             raise HTTPException(status_code=404, detail="Correlation not found.")
+        clear_correlations_cache()
         return {"status": "success", "id": corr_id, "action": "edited"}
     except Exception as pg_err:
         if "Correlation not found" in str(pg_err):
@@ -5138,6 +5179,7 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
                     conn.commit()
                     cur.close()
                     conn.close()
+                    clear_correlations_cache()
                     return {"status": "success", "id": corr_id, "action": "edited"}
                 except Exception:
                     pass
@@ -5146,6 +5188,7 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
 @app.post("/api/v1/correlations/generate")
 async def trigger_generate_correlations(background_tasks: BackgroundTasks, is_admin: bool = Depends(check_admin_access)):
     """Trigger the correlation engine to generate new proposed correlations in the background."""
+    clear_correlations_cache()
     from services.backend.correlation_engine import generate_correlations
     background_tasks.add_task(generate_correlations)
     return {"status": "success", "message": "Generation task scheduled in the background."}
@@ -5366,9 +5409,17 @@ async def get_sao_pdf(report_num: str):
             raise e
         raise HTTPException(status_code=500, detail=f"Error downloading PDF: {str(e)}")
 
+_home_suggestions_cache = None
+_home_suggestions_cache_time = 0.0
+
 @app.get("/api/v1/suggestions/home")
 async def get_home_suggestions():
     """Retrieve dynamic suggestion queries based on the most recent database records."""
+    global _home_suggestions_cache, _home_suggestions_cache_time
+    now = time.time()
+    if _home_suggestions_cache is not None and (now - _home_suggestions_cache_time < 300):
+        return _home_suggestions_cache
+
     suggestions = []
     
     # 1. Fetch from findings (audits)
@@ -5471,7 +5522,10 @@ async def get_home_suggestions():
             
     import random
     selected = random.sample(suggestions, min(3, len(suggestions)))
-    return {"suggestions": selected}
+    res = {"suggestions": selected}
+    _home_suggestions_cache = res
+    _home_suggestions_cache_time = now
+    return res
 
 class EntityAddRequest(BaseModel):
     name: str
