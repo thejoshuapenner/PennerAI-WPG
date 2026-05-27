@@ -70,7 +70,7 @@ const getApiUrl = () => {
       return 'http://localhost:8002';
     }
   }
-  return process.env.NEXT_PUBLIC_API_URL || 'https://penner-policy-api.loca.lt';
+  return process.env.NEXT_PUBLIC_API_URL || 'https://wa-policy-graph-backend.onrender.com';
 };
 
 // Globally override fetch to automatically inject Bypass-Tunnel-Reminder header for localtunnel

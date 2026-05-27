@@ -11,7 +11,7 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8002'}/api/:path*`,
+        destination: `${process.env.NEXT_PUBLIC_API_URL || 'https://wa-policy-graph-backend.onrender.com'}/api/:path*`,
       },
     ];
   },
