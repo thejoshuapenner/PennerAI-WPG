@@ -1449,7 +1449,7 @@ export default function CuratePage() {
                             {activeCorr.title}
                           </h2>
                           <p className="text-xs md:text-sm text-slate-500 font-medium mt-3 leading-relaxed border-l-2 border-emerald-500/60 pl-3.5 italic bg-slate-50/50 py-1 rounded-r-lg">
-                            "{activeCorr.hook}"
+                            &ldquo;{activeCorr.hook}&rdquo;
                           </p>
                         </div>
                         
@@ -1518,7 +1518,7 @@ export default function CuratePage() {
                           <div className="p-3 bg-amber-50/30 border border-amber-100 rounded-xl space-y-1">
                             <span className="block text-[8px] font-black text-amber-600 uppercase tracking-widest pl-0.5">Verbatim Audit Trail context:</span>
                             <p className="text-[10px] text-slate-650 leading-relaxed font-semibold italic">
-                              "{cit.verbatim_text_context || 'No verbatim context captured during sync.'}"
+                              &ldquo;{cit.verbatim_text_context || 'No verbatim context captured during sync.'}&rdquo;
                             </p>
                           </div>
                         </div>

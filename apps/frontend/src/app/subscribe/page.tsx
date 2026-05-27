@@ -130,7 +130,7 @@ export default function SubscribePage() {
               <div className="space-y-2">
                 <h2 className="text-2xl font-black text-slate-900 tracking-tight">Active Monitor Registered</h2>
                 <p className="text-sm text-slate-500 max-w-md mx-auto leading-relaxed font-semibold">
-                  Thank you! We've activated your civic monitor alert request. We will scan new SAO audits and municipal council transcripts, emailing updates immediately to <span className="font-bold text-slate-800 underline">{email}</span>.
+                  Thank you! We&apos;ve activated your civic monitor alert request. We will scan new SAO audits and municipal council transcripts, emailing updates immediately to <span className="font-bold text-slate-800 underline">{email}</span>.
                 </p>
               </div>
               

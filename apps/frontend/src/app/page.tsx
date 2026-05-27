@@ -1063,7 +1063,7 @@ export default function Dashboard() {
                       : 'bg-transparent border-transparent text-slate-500 hover:text-slate-900 hover:bg-white/40 hover:border-slate-200/50 hover:shadow-sm'
                   }`}
                 >
-                  <span className="truncate pr-2">"{t.title}"</span>
+                  <span className="truncate pr-2">&ldquo;{t.title}&rdquo;</span>
                   <ChevronRight className={`w-3.5 h-3.5 text-slate-400 group-hover:text-evergreen transition-colors ${t.id === activeThreadId ? 'translate-x-0' : '-translate-x-1 opacity-0 group-hover:opacity-100 group-hover:translate-x-0'}`} />
                 </button>
               ))}
@@ -1482,7 +1482,7 @@ export default function Dashboard() {
 
             <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-5 text-left text-xs md:text-sm">
               <div className="p-4 bg-slate-50 border-l-2 border-emerald-500 rounded-r-xl italic text-slate-650 font-medium">
-                "{selectedHomeCorr.hook}"
+                &ldquo;{selectedHomeCorr.hook}&rdquo;
               </div>
               <div className="prose prose-sm max-w-none text-slate-700 leading-relaxed font-medium space-y-4">
                 {renderMessageContent(
