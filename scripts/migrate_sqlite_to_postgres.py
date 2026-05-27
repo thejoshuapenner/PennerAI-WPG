@@ -11,7 +11,7 @@ from datetime import datetime
 SQLITE_DIR = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper"
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")

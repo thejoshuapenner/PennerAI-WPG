@@ -31,12 +31,7 @@ temp_downloads/
 vault/meetings/
 
 # Environment files and credentials
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
+.env*
 *.pem
 *.key
 
@@ -49,8 +44,9 @@ vault/meetings/
 ehthumbs.db
 Thumbs.db
 
-# Old temporary repositories folder
+# Old temporary repositories folder and scratch directory
 temp_repos/
+scratch/
 
 # Turborepo and next build artifacts
 .turbo/

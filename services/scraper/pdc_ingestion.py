@@ -13,7 +13,7 @@ load_dotenv(os.path.join(BASE_DIR, "../backend/.env"))
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 SQLITE_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/municipal_intent.db"
 
@@ -74,6 +74,7 @@ def sync_pdc_contributions():
         print(f"\n  === Processing Year {year} ===")
         offset = 0
         year_saved = 0
+        retries = 0
         
         while True:
             where_clause = f"receipt_date >= '{year}-01-01T00:00:00' AND receipt_date <= '{year}-12-31T23:59:59' AND amount IS NOT NULL"
@@ -90,7 +91,12 @@ def sync_pdc_contributions():
                 resp = requests.get(url, params=params, timeout=45)
                 if resp.status_code != 200:
                     print(f"    [ERROR] Socrata API returned {resp.status_code}: {resp.text}")
-                    break
+                    retries += 1
+                    if retries >= 3:
+                        print(f"    [CRITICAL] Maximum API errors reached for year {year} offset {offset}. Skipping remainder of year.")
+                        break
+                    time.sleep(5)
+                    continue
                     
                 contributions = resp.json()
                 if not contributions:
@@ -153,6 +159,9 @@ def sync_pdc_contributions():
                     total_saved += len(batch_data)
                     print(f"    Inserted {len(batch_data):,} records. Year total: {year_saved:,}")
                 
+                # Reset retries on successful fetch and insert
+                retries = 0
+                
                 if len(contributions) < page_size:
                     print(f"    Reached end of records for year {year}.")
                     break
@@ -161,9 +170,13 @@ def sync_pdc_contributions():
                 time.sleep(0.5) # Politeness delay
                 
             except Exception as e:
-                print(f"    Error during batch request: {e}")
+                retries += 1
+                print(f"    Error during batch request (attempt {retries}/3): {e}")
+                if retries >= 3:
+                    print(f"    [CRITICAL] Maximum retries reached for year {year} offset {offset}. Skipping remainder of year.")
+                    break
                 time.sleep(5) # Delay on error before retry
-                break
+                continue
                 
     # 3. Create indexes for fast queries
     print("\n  Building indexes on political_contributions...")

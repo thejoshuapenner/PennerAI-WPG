@@ -19,8 +19,8 @@ const config: Config = {
         void: '#E2E8F0'      // Light slate-200 border color
       },
       fontFamily: {
-        sans: ['Inter', 'Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-        serif: ['Playfair Display', 'Georgia', 'ui-serif', 'serif'],
+        sans: ['var(--font-outfit)', 'Outfit', 'Inter', 'Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        serif: ['var(--font-playfair)', 'Playfair Display', 'Georgia', 'ui-serif', 'serif'],
       },
       letterSpacing: {
         tight: '-0.015em',

@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: penner_governance_db
       POSTGRES_USER: penner_admin
-      POSTGRES_PASSWORD: penner_secret_password_2026
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
     ports:
       - "5432:5432"
     volumes:
@@ -27,7 +27,7 @@ services:
     container_name: penner_backend_service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://penner_admin:penner_secret_password_2026@db:5432/penner_governance_db
+      - DATABASE_URL=postgresql://penner_admin:${POSTGRES_PASSWORD:-postgres_dev_password}@db:5432/penner_governance_db
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MEMBRANE_API_KEY=${MEMBRANE_API_KEY}
     ports:

@@ -7,7 +7,7 @@ import psycopg2
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 
 SQLITE_TRACKING_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/usage_tracking.db"

@@ -41,9 +41,10 @@ app.add_middleware(
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
-SQLITE_TRACKING_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/usage_tracking.db"
+SQLITE_DIR = os.environ.get("SQLITE_DIR", "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper")
+SQLITE_TRACKING_PATH = os.path.join(SQLITE_DIR, "usage_tracking.db")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Initialize the Membrane client
@@ -148,32 +149,88 @@ def clean_summary_text(agenda_title: Optional[str], key_action: Optional[str] = 
 
     return title_str or action_str or "No description available"
 
+import contextlib
+from psycopg2.pool import ThreadedConnectionPool
+
+pg_pool = None
 _postgres_available = True
 _last_postgres_check_time = 0.0
 _postgres_check_cooldown = 30.0
 
+def get_pool():
+    global pg_pool, _postgres_available, _last_postgres_check_time
+    now = time.time()
+    if pg_pool is None:
+        if not _postgres_available and (now - _last_postgres_check_time < _postgres_check_cooldown):
+            return None
+        try:
+            pg_pool = ThreadedConnectionPool(1, 20, dsn=POSTGRES_URL, connect_timeout=2)
+            _postgres_available = True
+            _last_postgres_check_time = now
+        except Exception as e:
+            _postgres_available = False
+            _last_postgres_check_time = now
+            print(f"Failed to initialize Postgres connection pool: {e}")
+            pg_pool = None
+    return pg_pool
+
+class PooledConnectionWrapper:
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+        
+    def close(self):
+        if self._conn and self._pool:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception as e:
+                print(f"Error returning connection to pool: {e}")
+            finally:
+                self._conn = None
+                self._pool = None
+                
+    def __del__(self):
+        self.close()
+
 def get_pg_conn():
     global _postgres_available, _last_postgres_check_time
-    now = time.time()
-    if not _postgres_available and (now - _last_postgres_check_time < _postgres_check_cooldown):
+    pool = get_pool()
+    if not pool:
         raise psycopg2.OperationalError(
             "Postgres is down. Circuit breaker active (skipping connection attempt)."
         )
     try:
-        conn = psycopg2.connect(POSTGRES_URL, connect_timeout=2)
-        _postgres_available = True
-        _last_postgres_check_time = now
-        return conn
+        conn = pool.getconn()
+        return PooledConnectionWrapper(pool, conn)
     except Exception as e:
         _postgres_available = False
-        _last_postgres_check_time = now
+        _last_postgres_check_time = time.time()
         raise e
 
+@contextlib.contextmanager
+def db_session():
+    """Database session context manager to ensure connections are returned to the pool."""
+    conn = get_pg_conn()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 def get_sqlite_conn(db_name: str):
-    sqlite_dir = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper"
+    sqlite_dir = os.environ.get("SQLITE_DIR", "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper")
     db_path = os.path.join(sqlite_dir, db_name)
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        return conn
+    # Try local root folder as fallback
+    fallback_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", db_name))
+    if os.path.exists(fallback_path):
+        conn = sqlite3.connect(fallback_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 30000;")
         return conn
@@ -363,7 +420,7 @@ def bootstrap_database():
                 amount NUMERIC(15, 2) NOT NULL,
                 account_code VARCHAR(50),
                 description TEXT,
-                embedding vector(1536)
+                embedding vector(768)
             )
             """
         )
@@ -385,7 +442,7 @@ def bootstrap_database():
                 funding_source VARCHAR(100),
                 source_url TEXT,
                 last_updated TIMESTAMP DEFAULT NOW(),
-                embedding vector(1536)
+                embedding vector(768)
             )
             """
         )
@@ -404,7 +461,7 @@ def bootstrap_database():
                 federal_funding_amount NUMERIC(15, 2),
                 source_url TEXT,
                 last_updated TIMESTAMP DEFAULT NOW(),
-                embedding vector(1536),
+                embedding vector(768),
                 CONSTRAINT unique_district_financial_year UNIQUE (district_name, fiscal_year)
             )
             """
@@ -496,6 +553,18 @@ def bootstrap_database():
             """
         )
         
+        # Index Migrations
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_budget_items_budget_id ON budget_items(budget_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_grants_recipient ON grants(recipient_jurisdiction);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_school_district_financials_district ON school_district_financials(district_name);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_findings_jurisdiction ON findings(jurisdiction);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_budgets_jurisdiction_year ON budgets(jurisdiction_name, fiscal_year);")
+            print("PostgreSQL index migrations completed successfully.")
+        except Exception as idx_err:
+            print(f"PostgreSQL index migrations failed/skipped: {idx_err}")
+            
         conn.commit()
         cur.close()
         conn.close()
@@ -980,6 +1049,14 @@ def bootstrap_sqlite_tracking(conn):
             )
             """
         )
+        # SQLite Index migrations
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_ip_time ON usage_events(hashed_ip, timestamp);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_anon_id ON usage_events(anonymous_user_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON usage_events(session_id);")
+        except Exception as idx_err:
+            print("SQLite tracking index migrations failed/skipped:", idx_err)
+            
         conn.commit()
         cur.close()
     except Exception as e:
@@ -1687,24 +1764,21 @@ TOOLS_LIST = [
 OPENAI_TOOLS = [{"type": "function", "function": t} for t in TOOLS_LIST]
 
 async def get_embedding_async(text: str, client: httpx.AsyncClient) -> Optional[List[float]]:
-    """Get vector embedding (1536-dim padded) for query lookup asynchronously."""
+    """Get vector embedding (768-dim) for query lookup asynchronously."""
 
     if not GEMINI_API_KEY:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "models/gemini-embedding-2",
-        "content": {"parts": [{"text": text[:2000]}]},
-        "outputDimensionality": 1536
+        "model": "models/text-embedding-004",
+        "content": {"parts": [{"text": text[:2000]}]}
     }
     try:
         res = await client.post(url, headers=headers, json=payload, timeout=5)
         if res.status_code == 200:
             embedding = res.json()["embedding"]["values"]
-            if len(embedding) == 768:
-                embedding.extend([0.0] * 768)
-            return embedding[:1536]
+            return embedding[:768]
     except Exception as e:
         print(f"Error fetching embedding for query: {e}")
     return None
@@ -3323,11 +3397,35 @@ CRITICAL REQUIREMENTS:
         
     else:
         async def stream_generator():
-            # Resolve agent tools
-            _, final_messages, prompt_tokens, _ = await run_tool_loop_async(messages, temperature, max_tokens)
+            # Resolve agent tools and stream progress events
+            final_messages = messages
+            prompt_tokens = 0
+            
+            async for event in execute_agent_loop_async(messages, temperature, max_tokens):
+                if event["type"] == "progress":
+                    progress_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "content": "",
+                                    "progress": event["message"]
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(progress_chunk)}\n\n"
+                elif event["type"] == "final":
+                    final_messages = event["messages"]
+                    prompt_tokens = event["prompt_tokens"]
             
             try:
-                response = litellm.completion(
+                response = await litellm.acompletion(
                     model="gemini/gemini-3.5-flash",
                     messages=final_messages,
                     stream=True,
@@ -3336,7 +3434,7 @@ CRITICAL REQUIREMENTS:
                     api_key=GEMINI_API_KEY
                 )
                 full_text = ""
-                for chunk in response:
+                async for chunk in response:
                     delta_content = ""
                     if chunk.choices and len(chunk.choices) > 0:
                         delta = chunk.choices[0].delta
@@ -3429,8 +3527,107 @@ CRITICAL REQUIREMENTS:
                 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-async def run_tool_loop_async(messages: list, temperature: float, max_tokens: Optional[int]):
-    return await asyncio.to_thread(execute_agent_loop, messages, temperature, max_tokens)
+async def execute_agent_loop_async(messages: list, temperature: float, max_tokens: Optional[int]):
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    
+    print(f"[DEBUG AGENT LOOP] Starting async loop. Initial messages: {[m.get('role') for m in messages]}")
+    for iteration in range(5):
+        try:
+            print(f"[DEBUG AGENT LOOP] Iteration {iteration}. Messages context: {[m.get('role') for m in messages]}")
+            yield {"type": "progress", "message": f"Analyzing governance data (step {iteration+1})..."}
+            
+            response = await litellm.acompletion(
+                model="gemini/gemini-3.5-flash",
+                messages=messages,
+                tools=OPENAI_TOOLS,
+                tool_choice="auto",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_key=GEMINI_API_KEY
+            )
+            
+            usage = response.get("usage", {})
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
+            total_completion_tokens += usage.get("completion_tokens", 0)
+            
+            message = response.choices[0].message
+            print(f"[DEBUG AGENT LOOP] Iteration {iteration} response message: {message}")
+            
+            if hasattr(message, "model_dump"):
+                message_dict = message.model_dump()
+            elif hasattr(message, "dict"):
+                message_dict = message.dict()
+            else:
+                message_dict = dict(message)
+                
+            tool_calls = message_dict.get("tool_calls")
+            
+            if tool_calls:
+                print(f"[DEBUG AGENT LOOP] Gemini requested tool calls: {[tc['function']['name'] for tc in tool_calls]}")
+                messages.append(message_dict)
+                for tool_call in tool_calls:
+                    func_name = tool_call["function"]["name"]
+                    func_args_str = tool_call["function"]["arguments"]
+                    tc_id = tool_call["id"]
+                    
+                    # Yield progress update based on tool name
+                    if "search" in func_name or "query" in func_name:
+                        yield {"type": "progress", "message": f"Searching for audit/council data using {func_name}..."}
+                    elif "correlat" in func_name:
+                        yield {"type": "progress", "message": "Correlating and cross-referencing concepts..."}
+                    elif "bill" in func_name:
+                        yield {"type": "progress", "message": "Searching legislative bills..."}
+                    else:
+                        yield {"type": "progress", "message": f"Executing tool {func_name}..."}
+                        
+                    try:
+                        func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else func_args_str
+                        print(f"[DEBUG AGENT LOOP] Executing {func_name} async-wrap with args: {func_args}")
+                        tool_result = await asyncio.to_thread(run_tool, func_name, func_args)
+                        tool_result_str = json.dumps(tool_result)
+                        print(f"[DEBUG AGENT LOOP] Tool result length: {len(tool_result_str)}")
+                    except Exception as e:
+                        tool_result_str = json.dumps({"error": f"Tool execution failed: {str(e)}"})
+                        print(f"[DEBUG AGENT LOOP] Tool execution error: {str(e)}")
+                        
+                    messages.append({
+                        "role": "tool",
+                        "name": func_name,
+                        "tool_call_id": tc_id,
+                        "content": tool_result_str
+                    })
+                continue
+            else:
+                print(f"[DEBUG AGENT LOOP] No tool calls requested. Final content: {message_dict.get('content')[:100] if message_dict.get('content') else None}...")
+                yield {
+                    "type": "final",
+                    "content": message_dict.get("content") or "",
+                    "messages": messages,
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens
+                }
+                return
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[DEBUG AGENT LOOP] Exception in loop: {str(e)}")
+            yield {
+                "type": "final",
+                "content": f"Agent loop failed: {str(e)}",
+                "messages": messages,
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens
+            }
+            return
+            
+    yield {
+        "type": "final",
+        "content": "Error: Agent tool execution loop exceeded maximum iterations.",
+        "messages": messages,
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens
+    }
 
 def parse_metadata_from_text(text: str):
     confidence = 0.85
@@ -3470,76 +3667,18 @@ def extract_metadata_from_json(content_str: str):
         sources, confidence, last_updated = parse_metadata_from_text(content_str)
         return content_str, sources, confidence, last_updated
 
-# Tool calling logic inside the backend
-def execute_agent_loop(messages: list, temperature: float, max_tokens: Optional[int]):
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    
-    print(f"[DEBUG AGENT LOOP] Starting loop. Initial messages: {[m.get('role') for m in messages]}")
-    for iteration in range(5):
-        try:
-            print(f"[DEBUG AGENT LOOP] Iteration {iteration}. Messages context: {[m.get('role') for m in messages]}")
-            response = litellm.completion(
-                model="gemini/gemini-3.5-flash",
-                messages=messages,
-                tools=OPENAI_TOOLS,
-                tool_choice="auto",
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_key=GEMINI_API_KEY
-            )
-            
-            usage = response.get("usage", {})
-            total_prompt_tokens += usage.get("prompt_tokens", 0)
-            total_completion_tokens += usage.get("completion_tokens", 0)
-            
-            message = response.choices[0].message
-            print(f"[DEBUG AGENT LOOP] Iteration {iteration} response message: {message}")
-            
-            if hasattr(message, "model_dump"):
-                message_dict = message.model_dump()
-            elif hasattr(message, "dict"):
-                message_dict = message.dict()
-            else:
-                message_dict = dict(message)
-                
-            tool_calls = message_dict.get("tool_calls")
-            
-            if tool_calls:
-                print(f"[DEBUG AGENT LOOP] Gemini requested tool calls: {[tc['function']['name'] for tc in tool_calls]}")
-                messages.append(message_dict)
-                for tool_call in tool_calls:
-                    func_name = tool_call["function"]["name"]
-                    func_args_str = tool_call["function"]["arguments"]
-                    tc_id = tool_call["id"]
-                    
-                    try:
-                        func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else func_args_str
-                        print(f"[DEBUG AGENT LOOP] Executing {func_name} with args: {func_args}")
-                        tool_result = run_tool(func_name, func_args)
-                        tool_result_str = json.dumps(tool_result)
-                        print(f"[DEBUG AGENT LOOP] Tool result length: {len(tool_result_str)}")
-                    except Exception as e:
-                        tool_result_str = json.dumps({"error": f"Tool execution failed: {str(e)}"})
-                        print(f"[DEBUG AGENT LOOP] Tool execution error: {str(e)}")
-                        
-                    messages.append({
-                        "role": "tool",
-                        "name": func_name,
-                        "tool_call_id": tc_id,
-                        "content": tool_result_str
-                    })
-                continue
-            else:
-                print(f"[DEBUG AGENT LOOP] No tool calls requested. Final content: {message_dict.get('content')[:100] if message_dict.get('content') else None}...")
-                return message_dict.get("content") or "", messages, total_prompt_tokens, total_completion_tokens
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[DEBUG AGENT LOOP] Exception in loop: {str(e)}")
-            return f"Agent loop failed: {str(e)}", messages, total_prompt_tokens, total_completion_tokens
-            
-    return "Error: Agent tool execution loop exceeded maximum iterations.", messages, total_prompt_tokens, total_completion_tokens
+async def run_tool_loop_async(messages: list, temperature: float, max_tokens: Optional[int]):
+    final_content = ""
+    final_messages = messages
+    prompt_tokens = 0
+    completion_tokens = 0
+    async for event in execute_agent_loop_async(messages, temperature, max_tokens):
+        if event["type"] == "final":
+            final_content = event["content"]
+            final_messages = event["messages"]
+            prompt_tokens = event["prompt_tokens"]
+            completion_tokens = event["completion_tokens"]
+    return final_content, final_messages, prompt_tokens, completion_tokens
 
 
 
@@ -5185,12 +5324,21 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
                     pass
         raise HTTPException(status_code=500, detail="Failed to edit correlation.")
 
+CORRELATION_GEN_LOCK = asyncio.Lock()
+
 @app.post("/api/v1/correlations/generate")
 async def trigger_generate_correlations(background_tasks: BackgroundTasks, is_admin: bool = Depends(check_admin_access)):
     """Trigger the correlation engine to generate new proposed correlations in the background."""
+    if CORRELATION_GEN_LOCK.locked():
+        return {"status": "error", "message": "Correlation generation is already in progress."}
+        
+    async def run_under_lock():
+        async with CORRELATION_GEN_LOCK:
+            from services.backend.correlation_engine import generate_correlations
+            await asyncio.to_thread(generate_correlations)
+            
     clear_correlations_cache()
-    from services.backend.correlation_engine import generate_correlations
-    background_tasks.add_task(generate_correlations)
+    background_tasks.add_task(run_under_lock)
     return {"status": "success", "message": "Generation task scheduled in the background."}
 
 class CorrelationChatRequest(BaseModel):

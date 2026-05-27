@@ -5,7 +5,6 @@ import sqlite3
 import psycopg2
 import openpyxl
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
 
 # Load environmental variables
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,7 +12,7 @@ load_dotenv(os.path.join(BASE_DIR, "../backend/.env"))
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 SQLITE_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/municipal_intent.db"
 
@@ -127,44 +126,37 @@ def match_jurisdiction(common_name, jurisdictions) -> tuple:
     return None, None
 
 async def download_sao_extract(year) -> str:
-    """Uses Playwright to download the full single-year FIT data extract from the SAO website."""
-    url = "https://portal.sao.wa.gov/FIT/"
-    scratch_dir = "/Users/thejoshuapenner/.gemini/antigravity/brain/a79b3e23-62f8-4a39-a5f2-fafeec1789e0/scratch"
-    os.makedirs(scratch_dir, exist_ok=True)
+    """Downloads the full single-year FIT data extract from the SAO website directly via HTTP."""
+    url = f"https://portal.sao.wa.gov/FIT/extracts/FullExtract(year={year})"
+    
+    import tempfile
+    import requests
+    scratch_dir = tempfile.gettempdir()
     temp_file = os.path.join(scratch_dir, f"fit_{year}.xlsx")
     
-    print(f"  [PLAYWRIGHT] Downloading FIT data extract for Year {year}...")
+    print(f"  [HTTP] Downloading FIT data extract for Year {year} directly...")
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        
-        try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_timeout(3000)
-            
-            await page.click("text=Data Extracts")
-            await page.wait_for_timeout(3000)
-            
-            await page.click("text=Full Extracts")
-            await page.wait_for_timeout(4000)
-            
-            card_text = f"{year} Data"
-            print(f"  [PLAYWRIGHT] Clicking card: '{card_text}'...")
-            
-            async with page.expect_download(timeout=90000) as download_info:
-                await page.click(f"h5:has-text('{card_text}')")
-                
-            download = await download_info.value
-            await download.save_as(temp_file)
-            print(f"  [PLAYWRIGHT] Successfully downloaded {download.suggested_filename} to {temp_file}")
-            print(f"  [PLAYWRIGHT] Size: {os.path.getsize(temp_file):,} bytes")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        def do_download():
+            res = requests.get(url, headers=headers, timeout=120)
+            res.raise_for_status()
+            with open(temp_file, "wb") as f:
+                f.write(res.content)
             return temp_file
-        except Exception as e:
-            print(f"  [PLAYWRIGHT ERROR] Download failed for Year {year}: {e}")
-            return None
-        finally:
-            await browser.close()
+            
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, do_download)
+        
+        print(f"  [HTTP] Successfully downloaded to {temp_file}")
+        print(f"  [HTTP] Size: {os.path.getsize(temp_file):,} bytes")
+        return temp_file
+    except Exception as e:
+        print(f"  [HTTP ERROR] Download failed for Year {year}: {e}")
+        return None
 
 def parse_and_ingest_fit_file(file_path, year):
     """Parses the downloaded Excel file and ingests the General Fund budgets into the databases."""
@@ -464,45 +456,55 @@ async def sync_general_fund_budgets(years):
     global SQLITE_PATH
     print(f"🚀 [GENERAL FUND SYNC] Ingesting local General Fund budgets for years: {years}...")
     
-    # Copy database locally to prevent Google Drive lock during batch inserts
-    temp_db_path = "/Users/thejoshuapenner/.gemini/antigravity/brain/a79b3e23-62f8-4a39-a5f2-fafeec1789e0/scratch/municipal_intent_temp.db"
-    import shutil
     original_sqlite_path = SQLITE_PATH
+    if not os.path.exists(original_sqlite_path):
+        original_sqlite_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "municipal_intent.db"))
+        
+    import tempfile
+    import shutil
+    import portalocker
     
-    print(f"  [DB COPY] Copying database locally to: {temp_db_path}")
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "municipal_intent_temp.db")
+    
+    print(f"  [DB LOCK] Locking and copying database locally to temp: {temp_db_path}")
+    
     try:
-        shutil.copy2(original_sqlite_path, temp_db_path)
-        SQLITE_PATH = temp_db_path
-    except Exception as copy_err:
-        print(f"  [DB COPY ERROR] Local copy failed: {copy_err}. Proceeding with original path.")
-        temp_db_path = None
-
-    for year in years:
-        file_path = await download_sao_extract(year)
-        if file_path and os.path.exists(file_path):
-            try:
-                parse_and_ingest_fit_file(file_path, year)
-            except Exception as e:
-                print(f"  [ERROR] Processing failed for Year {year}: {e}")
-            finally:
-                try:
-                    os.remove(file_path)
-                    print(f"  Removed temporary file: {file_path}")
-                except Exception:
-                    pass
-        else:
-            print(f"  [ERROR] Download failed for Year {year}. Skipping...")
-
-    # Copy the database back to Google Drive
-    if temp_db_path and os.path.exists(temp_db_path):
-        print(f"  [DB COPY] Copying updated database back to: {original_sqlite_path}")
-        try:
-            shutil.copy2(temp_db_path, original_sqlite_path)
-            os.remove(temp_db_path)
-        except Exception as copy_back_err:
-            print(f"  [DB COPY ERROR] Copy back failed: {copy_back_err}")
+        if not os.path.exists(original_sqlite_path):
+            with open(original_sqlite_path, "w") as f:
+                pass
+                
+        with open(original_sqlite_path, "r+") as original_file:
+            portalocker.lock(original_file, portalocker.LOCK_EX)
             
-    SQLITE_PATH = original_sqlite_path
+            shutil.copy2(original_sqlite_path, temp_db_path)
+            SQLITE_PATH = temp_db_path
+            
+            for year in years:
+                file_path = await download_sao_extract(year)
+                if file_path and os.path.exists(file_path):
+                    try:
+                        parse_and_ingest_fit_file(file_path, year)
+                    except Exception as e:
+                        print(f"  [ERROR] Processing failed for Year {year}: {e}")
+                    finally:
+                        try:
+                            os.remove(file_path)
+                            print(f"  Removed temporary file: {file_path}")
+                        except Exception:
+                            pass
+                else:
+                    print(f"  [ERROR] Download failed for Year {year}. Skipping...")
+            
+            shutil.copy2(temp_db_path, original_sqlite_path)
+            portalocker.unlock(original_file)
+            print("  [DB LOCK] Lock released and database copied back successfully.")
+            
+    except Exception as e:
+        print(f"  [CRITICAL ERROR] SQLite locking sync failed: {e}")
+    finally:
+        shutil.rmtree(temp_dir)
+        SQLITE_PATH = original_sqlite_path
 
 if __name__ == "__main__":
     asyncio.run(sync_general_fund_budgets([2022, 2023, 2024, 2025]))

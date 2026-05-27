@@ -110,15 +110,81 @@ def clean_summary_text(agenda_title: Optional[str], key_action: Optional[str] = 
 
     return title_str or action_str or "No description available"
 
+from psycopg2.pool import ThreadedConnectionPool
+import time
+
+_pg_pool = None
+_postgres_available = True
+_last_postgres_check_time = 0.0
+_postgres_check_cooldown = 30.0
+
+def get_pool():
+    global _pg_pool, _postgres_available, _last_postgres_check_time
+    now = time.time()
+    if _pg_pool is None:
+        if not _postgres_available and (now - _last_postgres_check_time < _postgres_check_cooldown):
+            return None
+        try:
+            _pg_pool = ThreadedConnectionPool(1, 20, dsn=POSTGRES_URL, connect_timeout=2)
+            _postgres_available = True
+            _last_postgres_check_time = now
+        except Exception as e:
+            _postgres_available = False
+            _last_postgres_check_time = now
+            print(f"Failed to initialize correlation Postgres pool: {e}")
+            _pg_pool = None
+    return _pg_pool
+
+class PooledConnectionWrapper:
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+        
+    def close(self):
+        if self._conn and self._pool:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception as e:
+                print(f"Error returning correlation connection to pool: {e}")
+            finally:
+                self._conn = None
+                self._pool = None
+                
+    def __del__(self):
+        self.close()
+
 def get_pg_conn():
-    return psycopg2.connect(POSTGRES_URL)
+    global _postgres_available, _last_postgres_check_time
+    pool = get_pool()
+    if not pool:
+        raise psycopg2.OperationalError(
+            "Postgres is down. Circuit breaker active."
+        )
+    try:
+        conn = pool.getconn()
+        return PooledConnectionWrapper(pool, conn)
+    except Exception as e:
+        _postgres_available = False
+        _last_postgres_check_time = time.time()
+        raise e
 
 def get_sqlite_conn(db_name: str):
-    sqlite_dir = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper"
+    sqlite_dir = os.environ.get("SQLITE_DIR", "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper")
     db_path = os.path.join(sqlite_dir, db_name)
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        return conn
+    # Try local root folder as fallback
+    fallback_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", db_name))
+    if os.path.exists(fallback_path):
+        conn = sqlite3.connect(fallback_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000;")
         return conn
     return None
 

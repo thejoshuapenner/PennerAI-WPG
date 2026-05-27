@@ -14,7 +14,7 @@ load_dotenv(os.path.join(BASE_DIR, "../backend/.env"))
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 SQLITE_PATH = "/Users/thejoshuapenner/My Drive/Penner Strategy/sao-scraper/municipal_intent.db"
 
@@ -263,24 +263,12 @@ def sync_grants():
     sqlite_cur = sqlite_conn.cursor() if sqlite_conn else None
     pg_cur = pg_conn.cursor() if pg_conn else None
     
-    print("  Truncating grants tables...")
-    if sqlite_cur:
-        try:
-            sqlite_cur.execute("DELETE FROM grants")
-            sqlite_conn.commit()
-        except Exception as e:
-            print(f"  [ERROR] SQLite truncate failed: {e}")
-    if pg_cur:
-        try:
-            pg_cur.execute("DELETE FROM grants")
-            pg_conn.commit()
-        except Exception as e:
-            print(f"  [ERROR] Postgres truncate failed: {e}")
-            
-    # Batch Insert SQLite
+    # SQLite Transactional Update
     if sqlite_conn and sqlite_cur and grants_to_insert:
-        print("  Inserting records into SQLite...")
+        print("  Updating SQLite database (transactional)...")
         try:
+            sqlite_cur.execute("BEGIN TRANSACTION;")
+            sqlite_cur.execute("DELETE FROM grants")
             sqlite_cur.executemany(
                 """
                 INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, recipient_entity_type, award_amount, award_date, performance_period_start, performance_period_end, purpose_category, funding_source, source_url, embedding)
@@ -292,12 +280,15 @@ def sync_grants():
             if not pg_conn:
                 saved_count = len(grants_to_insert)
         except Exception as e:
-            print(f"  [ERROR] SQLite batch insert failed: {e}")
+            sqlite_conn.rollback()
+            print(f"  [ERROR] SQLite transactional sync failed: {e}")
             
-    # Batch Insert Postgres
+    # Postgres Transactional Update
     if pg_conn and pg_cur and grants_to_insert:
-        print("  Inserting records into Postgres...")
+        print("  Updating Postgres database (transactional)...")
         try:
+            pg_cur.execute("BEGIN;")
+            pg_cur.execute("DELETE FROM grants")
             pg_cur.executemany(
                 """
                 INSERT INTO grants (grant_title, grant_id, awarding_agency, recipient_jurisdiction, recipient_entity_type, award_amount, award_date, performance_period_start, performance_period_end, purpose_category, funding_source, source_url, embedding)
@@ -308,8 +299,8 @@ def sync_grants():
             pg_conn.commit()
             saved_count = len(grants_to_insert)
         except Exception as e:
-            print(f"  [ERROR] Postgres batch insert failed: {e}")
             pg_conn.rollback()
+            print(f"  [ERROR] Postgres transactional sync failed: {e}")
             
     if sqlite_conn:
         sqlite_cur.close()

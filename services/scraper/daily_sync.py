@@ -16,7 +16,7 @@ load_dotenv()
 
 POSTGRES_URL = os.environ.get(
     "DATABASE_URL", 
-    "postgresql://penner_admin:penner_secret_password_2026@localhost:5432/penner_governance_db"
+    "postgresql://penner_admin:postgres_dev_password@localhost:5432/penner_governance_db"
 )
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
@@ -35,7 +35,7 @@ def get_pg_conn():
     return psycopg2.connect(POSTGRES_URL)
 
 def get_embedding(text: str) -> list:
-    """Fetch 1536-dim embedding vector."""
+    """Fetch 768-dim embedding vector."""
     if not GEMINI_API_KEY:
         return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
@@ -48,12 +48,145 @@ def get_embedding(text: str) -> list:
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code == 200:
             embedding = res.json()["embedding"]["values"]
-            if len(embedding) == 768:
-                embedding.extend([0.0] * 768)
-            return embedding[:1536]
+            return embedding[:768]
     except Exception as e:
         print(f"Embedding failed: {e}")
     return None
+
+import re
+
+def extract_audit_findings_text_chunks(pdf_path: str) -> list:
+    """Scans PDF for pages containing 'FINDING' and returns 5-page windows as text chunks."""
+    try:
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+        matching_pages = []
+        for i in range(total_pages):
+            page_text = reader.pages[i].extract_text() or ""
+            if re.search(r'\bfindings?\b', page_text, re.IGNORECASE):
+                matching_pages.append(i)
+        
+        # If no page contains "FINDING", default to first 5 pages as a chunk
+        if not matching_pages:
+            text = ""
+            for i in range(min(5, total_pages)):
+                text += f"--- PAGE {i+1} ---\n"
+                text += reader.pages[i].extract_text() or ""
+                text += "\n"
+            return [text] if text.strip() else []
+        
+        # Build 5-page windows around each matching page
+        chunks = []
+        processed_windows = set()
+        for page_idx in matching_pages:
+            start = max(0, page_idx - 2)
+            end = min(total_pages - 1, page_idx + 2)
+            window_key = (start, end)
+            if window_key in processed_windows:
+                continue
+            processed_windows.add(window_key)
+            
+            chunk_text = ""
+            for idx in range(start, end + 1):
+                chunk_text += f"--- PAGE {idx+1} ---\n"
+                chunk_text += reader.pages[idx].extract_text() or ""
+                chunk_text += "\n"
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+        return chunks
+    except Exception as e:
+        print(f"Error extracting text from PDF {pdf_path}: {e}")
+        return []
+
+def parse_membrane_extraction(content_str: str) -> dict:
+    """Helper to parse JSON string from Membrane completions/swarm response with regex fallback."""
+    if not content_str:
+        return {}
+    content_str = content_str.strip()
+    
+    # 1. Try direct json load
+    try:
+        return json.loads(content_str)
+    except Exception:
+        pass
+        
+    # 2. Extract markdown codeblock
+    try:
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content_str, re.DOTALL | re.IGNORECASE)
+        if match:
+            return json.loads(match.group(1))
+    except Exception:
+        pass
+        
+    # 3. Last resort: match anything between { and }
+    try:
+        match = re.search(r'(\{.*\})', content_str, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+    except Exception:
+        pass
+        
+    return {}
+
+def extract_finding_from_swarm_extractions(extractions, default_year=None):
+    best_finding = None
+    for ext in extractions:
+        prime = {}
+        if isinstance(ext, dict):
+            if "summary" in ext and ext.get("summary"):
+                prime = ext
+            elif "content" in ext and isinstance(ext["content"], str):
+                prime = parse_membrane_extraction(ext["content"])
+            elif "message" in ext and isinstance(ext["message"], dict):
+                content = ext["message"].get("content", "")
+                prime = parse_membrane_extraction(content)
+            elif "extracted_data" in ext:
+                if isinstance(ext["extracted_data"], dict):
+                    prime = ext["extracted_data"]
+                elif isinstance(ext["extracted_data"], str):
+                    prime = parse_membrane_extraction(ext["extracted_data"])
+        elif isinstance(ext, str):
+            prime = parse_membrane_extraction(ext)
+            
+        if not prime or not prime.get("summary"):
+            continue
+            
+        summary = prime.get("summary")
+        category = prime.get("category", "Accountability")
+        root_cause = prime.get("root_cause", "")
+        
+        dollar_impact = prime.get("dollar_impact", 0)
+        try:
+            if isinstance(dollar_impact, str):
+                dollar_impact = re.sub(r'[^\d]', '', dollar_impact)
+                dollar_impact = int(dollar_impact) if dollar_impact else 0
+            else:
+                dollar_impact = int(dollar_impact)
+        except Exception:
+            dollar_impact = 0
+            
+        verbatim = prime.get("verbatim_text_context", "")
+        year = prime.get("year", default_year)
+        try:
+            year = int(year) if year else default_year
+        except Exception:
+            year = default_year
+            
+        candidate = {
+            "category": category,
+            "summary": summary,
+            "root_cause": root_cause,
+            "dollar_impact": dollar_impact,
+            "verbatim_text_context": verbatim,
+            "year": year
+        }
+        
+        if not best_finding:
+            best_finding = candidate
+        elif candidate["dollar_impact"] > best_finding["dollar_impact"]:
+            best_finding = candidate
+            
+    return best_finding
 
 def sync_sao_reports():
     print("🚀 [SAO SYNC] Fetching latest audit reports with findings (2020-Present)...")
@@ -98,21 +231,13 @@ def sync_sao_reports():
             print(f"    Download error: {e}")
             continue
 
-        # Extract combined text of first 15 pages
-        try:
-            reader = PdfReader(pdf_path)
-            text = ""
-            for i in range(min(15, len(reader.pages))):
-                text += reader.pages[i].extract_text() + "\n"
-        except Exception as e:
-            print(f"    Error reading PDF text: {e}")
-            continue
-
-        if not text.strip():
+        # Extract text chunks around FINDING window matches
+        chunks = extract_audit_findings_text_chunks(pdf_path)
+        if not chunks:
             print("    No text extracted from PDF, skipping.")
             continue
             
-        print("    Extracting structured finding via Membrane response_format...")
+        print(f"    Extracting structured finding via Membrane swarm_map over {len(chunks)} chunks...")
         schema_dict = {
             "type": "json_object",
             "schema": {
@@ -128,34 +253,16 @@ def sync_sao_reports():
             }
         }
         
-        messages = [
-            {
-                "role": "system", 
-                "content": "You are a professional government auditor. Extract the primary audit finding details from this Washington State Auditor report text. If multiple findings exist, choose the most severe one."
-            },
-            {
-                "role": "user", 
-                "content": f"Extract the primary finding in JSON format matching the schema:\n\nReport Text:\n{text[:45000]}"
-            }
-        ]
+        system_prompt = "You are a professional government auditor. Extract the primary audit finding details from this Washington State Auditor report text snippet. If multiple findings exist, choose the most severe one."
         
-        res_data = membrane.chat_completion(
-            messages=messages,
-            response_format=schema_dict
+        swarm_res = membrane.swarm_map(
+            chunks=chunks,
+            system_prompt=system_prompt,
+            extraction_criteria=schema_dict
         )
         
-        try:
-            choice = res_data.get("choices", [])[0]
-            content_str = choice.get("message", {}).get("content", "")
-            if "```json" in content_str:
-                content_str = content_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in content_str:
-                content_str = content_str.split("```")[1].split("```")[0].strip()
-                
-            prime = json.loads(content_str)
-        except Exception as parse_err:
-            print("    Failed parsing Membrane response format:", parse_err)
-            continue
+        extractions = swarm_res.get("extractions", [])
+        prime = extract_finding_from_swarm_extractions(extractions)
             
         if prime and prime.get("summary"):
             category = prime.get("category", "Accountability")
@@ -166,7 +273,7 @@ def sync_sao_reports():
             
             print(f"    Saving finding to PostgreSQL. Category: {category} | Dollar Impact: ${dollar_impact:,}")
             
-            # Embed finding summary
+            # Embed finding summary (768-dim unpadded)
             embedding = get_embedding(summary)
             
             cur.execute(

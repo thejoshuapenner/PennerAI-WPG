@@ -1,6 +1,11 @@
 "use client";
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Link from 'next/link';
+import { WaveCanvas } from '../components/ui/WaveCanvas';
+import { SearchForm } from '../components/ui/SearchForm';
+import { MessageBubble } from '../components/chat/MessageBubble';
+import { CorrelationCard } from '../components/explorer/CorrelationCard';
+import { DocumentViewer } from '../components/explorer/DocumentViewer';
 import { 
   Sparkles, 
   Send, 
@@ -385,8 +390,15 @@ export default function Dashboard() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   
-  // Resizable Explorer & Collapsible States
-  const [explorerWidth, setExplorerWidth] = useState(320);
+  // Stream ref and interval refs for render throttling
+  const streamTextRef = useRef('');
+  const flushIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Resizable Explorer & Collapsible States (stored in CSS variable, initial value set on mount)
+  useEffect(() => {
+    document.documentElement.style.setProperty('--explorer-width', '320px');
+  }, []);
+
   const [explorerTab, setExplorerTab] = useState<'correlations' | 'viewer'>('correlations');
   const [selectedDocument, setSelectedDocument] = useState<{ text: string; url: string; type: 'audit' | 'council' | 'web' | 'bill' | 'grant' } | null>(null);
   const isResizing = useRef(false);
@@ -436,8 +448,6 @@ export default function Dashboard() {
     fetchSuggestions();
   }, []);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const typewriterRef = useRef<HTMLSpanElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
   // Sync active thread lens setting
@@ -495,7 +505,7 @@ export default function Dashboard() {
     }
     const newWidth = window.innerWidth - e.clientX;
     if (newWidth > 240 && newWidth < window.innerWidth * 0.6) {
-      setExplorerWidth(newWidth);
+      document.documentElement.style.setProperty('--explorer-width', `${newWidth}px`);
     }
   }, []);
 
@@ -530,165 +540,7 @@ export default function Dashboard() {
     setExplorerTab('viewer');
   }, []);
 
-  // Typewriter effect in Hero state
-  useEffect(() => {
-    if (activeThreadId) return;
-    
-    const samplePrompts = [
-      "Which cities passed sales taxes for police services this year?",
-      "Summarize recent audit findings for Bellevue School District.",
-      "Has there been any mention of gas tax expenditures in King County?",
-      "Show me procurement policy violations in county audits."
-    ];
-    
-    let promptIndex = 0;
-    let charIndex = 0;
-    let isDeleting = false;
-    let delay = 80;
-    let timer: NodeJS.Timeout;
 
-    const tick = () => {
-      const activeText = samplePrompts[promptIndex];
-      if (!typewriterRef.current) return;
-
-      if (isDeleting) {
-        charIndex--;
-        typewriterRef.current.innerText = activeText.substring(0, charIndex);
-        delay = 30;
-      } else {
-        charIndex++;
-        typewriterRef.current.innerText = activeText.substring(0, charIndex);
-        delay = 70;
-      }
-
-      if (!isDeleting && charIndex === activeText.length) {
-        isDeleting = true;
-        delay = 2500;
-      } else if (isDeleting && charIndex === 0) {
-        isDeleting = false;
-        promptIndex = (promptIndex + 1) % samplePrompts.length;
-        delay = 500;
-      }
-
-      timer = setTimeout(tick, delay);
-    };
-
-    timer = setTimeout(tick, 500);
-    return () => clearTimeout(timer);
-  }, [threads.length]);
-
-  // Canvas wave animation
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    let width = window.innerWidth;
-    let height = window.innerHeight;
-    let mouseX = width / 2;
-    let mouseY = height / 2;
-    let time = 0;
-    let animationFrameId: number;
-
-    const resize = () => {
-      width = window.innerWidth;
-      height = window.innerHeight;
-      canvas.width = width;
-      canvas.height = height;
-    };
-
-    const handleMouseMoveCanvas = (e: MouseEvent) => {
-      mouseX = e.clientX;
-      mouseY = e.clientY;
-    };
-
-    window.addEventListener('resize', resize);
-    window.addEventListener('mousemove', handleMouseMoveCanvas);
-    resize();
-
-    const draw = () => {
-      ctx.clearRect(0, 0, width, height);
-      
-      const gridGradient = ctx.createRadialGradient(mouseX, mouseY, 50, mouseX, mouseY, 450);
-      gridGradient.addColorStop(0, 'rgba(12, 90, 76, 0.40)'); // Richer teal glow near cursor
-      gridGradient.addColorStop(0.4, 'rgba(12, 90, 76, 0.20)'); // Prominent mid-range lines
-      gridGradient.addColorStop(0.8, 'rgba(12, 90, 76, 0.08)'); // Subtle outer lines
-      gridGradient.addColorStop(1, 'rgba(12, 90, 76, 0.00)'); // Smooth complete fade out
-      ctx.strokeStyle = gridGradient;
-      ctx.lineWidth = 1.0;
-      
-      const rows = 15;
-      const cols = 25;
-      const xSpacing = width / cols;
-      const ySpacing = height / rows;
-
-      // Draw horizontal lines
-      for (let r = 0; r <= rows; r++) {
-        const yBase = r * ySpacing;
-        ctx.beginPath();
-        for (let c = 0; c <= cols; c++) {
-          const x = c * xSpacing;
-          const dx = x - mouseX;
-          const dy = yBase - mouseY;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          const mouseInfluence = Math.max(0, 400 - dist) / 400;
-          
-          const waveX = Math.sin(x * 0.003 + time) * 15;
-          const waveY = Math.cos(yBase * 0.003 + time) * 15;
-          const bulge = Math.pow(mouseInfluence, 2.5) * -50;
-
-          const finalY = yBase + waveY + (bulge * (dy / (dist || 1)));
-          const finalX = x + waveX + (bulge * (dx / (dist || 1)));
-
-          if (c === 0) {
-            ctx.moveTo(finalX, finalY);
-          } else {
-            ctx.lineTo(finalX, finalY);
-          }
-        }
-        ctx.stroke();
-      }
-
-      // Draw vertical lines
-      for (let c = 0; c <= cols; c++) {
-        const xBase = c * xSpacing;
-        ctx.beginPath();
-        for (let r = 0; r <= rows; r++) {
-          const y = r * ySpacing;
-          const dx = xBase - mouseX;
-          const dy = y - mouseY;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          const mouseInfluence = Math.max(0, 400 - dist) / 400;
-          
-          const waveX = Math.sin(xBase * 0.003 + time) * 15;
-          const waveY = Math.cos(y * 0.003 + time) * 15;
-          const bulge = Math.pow(mouseInfluence, 2.5) * -50;
-
-          const finalY = y + waveY + (bulge * (dy / (dist || 1)));
-          const finalX = xBase + waveX + (bulge * (dx / (dist || 1)));
-
-          if (r === 0) {
-            ctx.moveTo(finalX, finalY);
-          } else {
-            ctx.lineTo(finalX, finalY);
-          }
-        }
-        ctx.stroke();
-      }
-
-      time += 0.006;
-      animationFrameId = requestAnimationFrame(draw);
-    };
-
-    draw();
-
-    return () => {
-      window.removeEventListener('resize', resize);
-      window.removeEventListener('mousemove', handleMouseMoveCanvas);
-      cancelAnimationFrame(animationFrameId);
-    };
-  }, []);
 
   // Auto scroll chat
   useEffect(() => {
@@ -750,6 +602,13 @@ export default function Dashboard() {
       ? currentThread.messages.map(m => ({ role: m.role, content: m.content }))
       : [];
 
+    // Reset stream ref
+    streamTextRef.current = "";
+    if (flushIntervalRef.current) {
+      clearInterval(flushIntervalRef.current);
+      flushIntervalRef.current = null;
+    }
+
     try {
       const anonHeaders: Record<string, string> = typeof window !== 'undefined' ? {
         'x-anonymous-user-id': localStorage.getItem('penner_anon_id') || 'unknown-user',
@@ -778,10 +637,26 @@ export default function Dashboard() {
 
       if (!response.body) throw new Error("No stream body");
 
+      // Start the flush interval (every 100ms)
+      flushIntervalRef.current = setInterval(() => {
+        setThreads(prev => prev.map(t => {
+          if (t.id === currentThreadId) {
+            const msgs = [...t.messages];
+            const lastIdx = msgs.length - 1;
+            if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
+              if (msgs[lastIdx].content !== streamTextRef.current) {
+                msgs[lastIdx] = { ...msgs[lastIdx], content: streamTextRef.current };
+              }
+            }
+            return { ...t, messages: msgs };
+          }
+          return t;
+        }));
+      }, 100);
+
       const reader = response.body.getReader();
       try {
         const decoder = new TextDecoder();
-        let narrativeBuffer = "";
         let streamBuffer = "";
 
         while (true) {
@@ -822,18 +697,7 @@ export default function Dashboard() {
                   }));
                 }
                 if (data.chunk) {
-                  narrativeBuffer += data.chunk;
-                  setThreads(prev => prev.map(t => {
-                    if (t.id === currentThreadId) {
-                      const msgs = [...t.messages];
-                      const lastIdx = msgs.length - 1;
-                      if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
-                        msgs[lastIdx] = { ...msgs[lastIdx], content: narrativeBuffer };
-                      }
-                      return { ...t, messages: msgs };
-                    }
-                    return t;
-                  }));
+                  streamTextRef.current += data.chunk;
                 } else if (data.citations || data.db_citations || data.suggestions || data.correlations || data.lens_metadata) {
                   setThreads(prev => prev.map(t => {
                     if (t.id === currentThreadId) {
@@ -842,7 +706,6 @@ export default function Dashboard() {
                       if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
                         msgs[lastIdx] = {
                           ...msgs[lastIdx],
-                          content: data.content || msgs[lastIdx].content,
                           citations: (data.citations && data.citations.length > 0) ? data.citations : msgs[lastIdx].citations,
                           dbCitations: (data.db_citations && data.db_citations.length > 0) ? data.db_citations : msgs[lastIdx].dbCitations,
                           suggestions: (data.suggestions && data.suggestions.length > 0) ? data.suggestions : msgs[lastIdx].suggestions,
@@ -862,16 +725,24 @@ export default function Dashboard() {
           }
         }
       } finally {
+        if (flushIntervalRef.current) {
+          clearInterval(flushIntervalRef.current);
+          flushIntervalRef.current = null;
+        }
         try {
           reader.releaseLock();
         } catch (_) {}
-        // Guarantee loading: false for the last message
+        // Guarantee loading: false and final flush of streamTextRef.current
         setThreads(prev => prev.map(t => {
           if (t.id === currentThreadId) {
             const msgs = [...t.messages];
             const lastIdx = msgs.length - 1;
-            if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant' && msgs[lastIdx].loading) {
-              msgs[lastIdx] = { ...msgs[lastIdx], loading: false };
+            if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
+              msgs[lastIdx] = { 
+                ...msgs[lastIdx], 
+                content: streamTextRef.current,
+                loading: false 
+              };
             }
             return { ...t, messages: msgs };
           }
@@ -880,6 +751,10 @@ export default function Dashboard() {
       }
     } catch (e) {
       console.error(e);
+      if (flushIntervalRef.current) {
+        clearInterval(flushIntervalRef.current);
+        flushIntervalRef.current = null;
+      }
       setThreads(prev => prev.map(t => {
         if (t.id === currentThreadId) {
           const msgs = [...t.messages];
@@ -1001,7 +876,7 @@ export default function Dashboard() {
     <div className={`h-screen w-screen overflow-hidden relative flex flex-col font-sans antialiased text-mist bg-transparent ${resizing ? 'select-none' : ''}`}>
       {/* Noise overlay and Wave canvas background */}
       <div className="grain-overlay" />
-      <canvas ref={canvasRef} className="fixed inset-0 w-full h-full pointer-events-none z-0 opacity-100 transition-opacity duration-1000" />
+      <WaveCanvas />
       <div className="fixed top-[-20%] left-[-10%] w-[60%] h-[60%] rounded-full bg-evergreen/[0.08] blur-[130px] pointer-events-none z-0" />
       <div className="fixed bottom-[-20%] right-[-10%] w-[60%] h-[60%] rounded-full bg-emerald-600/[0.06] blur-[130px] pointer-events-none z-0" />
 
@@ -1021,15 +896,16 @@ export default function Dashboard() {
           <div>
             <h1 className="font-extrabold text-xl tracking-tight text-slate-900 flex items-center gap-1.5">
               PennerAI
-              <span
+              <button
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowBetaDisclosure(true);
                 }}
                 className="text-[9px] font-extrabold uppercase tracking-wider text-emerald-800 bg-emerald-50 hover:bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-250/50 cursor-pointer transition-colors"
+                type="button"
               >
                 Beta
-              </span>
+              </button>
             </h1>
             <p className="text-[10px] font-medium text-slate-500 flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-evergreen shrink-0"></span>
@@ -1238,30 +1114,12 @@ export default function Dashboard() {
                   </p>
 
                   {/* Main Hero Input Box */}
-                  <form onSubmit={(e) => handleSubmit(e)} className="w-full relative group max-w-xl mb-6 shrink-0">
-                    <div className="absolute inset-0 bg-evergreen/5 rounded-2xl blur-lg group-focus-within:bg-evergreen/10 transition-all" />
-                    <div className="relative flex items-center bg-white border-2 border-slate-200 group-focus-within:border-evergreen rounded-2xl overflow-hidden shadow-2xl transition-all pr-3">
-                      <input 
-                        type="text"
-                        className="w-full py-4 px-5 bg-transparent border-none outline-none font-semibold text-slate-800 placeholder-transparent text-sm"
-                        placeholder=""
-                        value={query}
-                        onChange={e => setQuery(e.target.value)}
-                      />
-                      {!query && (
-                        <div className="absolute left-5 pointer-events-none text-slate-400 font-semibold text-sm flex items-center gap-1">
-                          <span ref={typewriterRef} />
-                          <span className="w-1 h-4 bg-evergreen animate-pulse" />
-                        </div>
-                      )}
-                      <button 
-                        type="submit" 
-                        className="p-2.5 bg-evergreen hover:bg-emerald-700 rounded-xl text-white transition-all shadow-md cursor-pointer border-none"
-                      >
-                        <ArrowRight className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </form>
+                  <SearchForm 
+                    onSubmit={(q) => handleSubmit(undefined, q)} 
+                    placeholder="Ask any question to map facts and analyze correlations..."
+                    showTypewriter={true}
+                    className="max-w-xl mb-6 shrink-0"
+                  />
 
                   {/* Sample Prompt Chips */}
                   <div className="flex flex-col gap-2.5 justify-center mb-10 w-full max-w-xl shrink-0">
@@ -1324,180 +1182,27 @@ export default function Dashboard() {
                 <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
                   <div className="max-w-3xl mx-auto w-full space-y-6">
                     {activeThread?.messages.map((msg, idx) => (
-                      <div 
-                        key={idx} 
-                        className={`flex flex-col w-full ${msg.role === 'user' ? 'ml-auto items-end' : 'mr-auto items-start w-full'}`}
-                      >
-                        {/* Message Bubble */}
-                        <div 
-                          className={`px-5 py-3.5 rounded-2xl text-sm leading-relaxed ${
-                            msg.role === 'user' 
-                              ? 'bg-evergreen text-white rounded-br-none shadow-md font-medium max-w-xl' 
-                              : 'bg-white border border-slate-200/80 text-slate-800 rounded-bl-none w-full shadow-md'
-                          }`}
-                        >
-                          {msg.role === 'user' ? (
-                            <div className="whitespace-pre-wrap font-medium text-xs md:text-sm text-white">
-                              {msg.content}
-                            </div>
-                          ) : msg.loading && !msg.content ? (
-                            <div className="py-4 px-2 space-y-4 w-full text-slate-800">
-                              {/* Active Status Header */}
-                              <div className="flex items-center gap-2.5">
-                                <RefreshCw className="w-3.5 h-3.5 animate-spin text-evergreen" />
-                                <span className="font-extrabold tracking-wide text-xs uppercase text-evergreen">
-                                  {msg.statusMessage || "Querying Membrane Nodes..."}
-                                </span>
-                              </div>
-
-                              <div className="space-y-2 pt-1">
-                                {/* Progress bar container */}
-                                <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden shadow-inner relative">
-                                  <div 
-                                    className="bg-gradient-to-r from-emerald-500 via-teal-600 to-evergreen h-full rounded-full transition-all duration-700 ease-out shadow-sm"
-                                    style={{ width: `${
-                                      msg.status === 'intent' ? 25 :
-                                      msg.status === 'searching' ? 50 :
-                                      msg.status === 'correlating' ? 75 :
-                                      msg.status === 'synthesizing' ? 95 : 10
-                                    }%` }}
-                                  />
-                                </div>
-                                {/* Step labels */}
-                                <div className="flex justify-between items-center text-[10px] font-bold text-slate-400 px-0.5 font-sans">
-                                  <span className={msg.status === 'intent' ? 'text-evergreen font-black scale-105 transition-all' : ['searching', 'correlating', 'synthesizing'].includes(msg.status || '') ? 'text-emerald-600' : ''}>
-                                    1. Intent Gate
-                                  </span>
-                                  <span className={msg.status === 'searching' ? 'text-evergreen font-black scale-105 transition-all' : ['correlating', 'synthesizing'].includes(msg.status || '') ? 'text-emerald-600' : ''}>
-                                    2. DB Search
-                                  </span>
-                                  <span className={msg.status === 'correlating' ? 'text-evergreen font-black scale-105 transition-all' : ['synthesizing'].includes(msg.status || '') ? 'text-emerald-600' : ''}>
-                                    3. Correlations
-                                  </span>
-                                  <span className={msg.status === 'synthesizing' ? 'text-evergreen font-black scale-105 transition-all' : ''}>
-                                    4. Synthesis
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="space-y-4 font-medium">
-                              {renderMessageContent(msg.content, msg.citations, msg.dbCitations, handleCitationClick, lens)}
-                              {msg.loading && (
-                                <div className="flex items-center gap-2 pt-2.5 border-t border-slate-100 mt-3 text-slate-400">
-                                  <RefreshCw className="w-3 h-3 animate-spin text-evergreen" />
-                                  <span className="text-[10px] font-bold uppercase tracking-wider text-evergreen animate-pulse">
-                                    {msg.statusMessage || "Synthesizing response..."}
-                                  </span>
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-
-                      {/* Metadata Citations / Suggestions */}
-                      {!msg.loading && msg.role === 'assistant' && (
-                        <div className="mt-3 space-y-4 w-full">
-                                               {/* Web Citations */}
-                          {msg.citations && msg.citations.length > 0 && (
-                            <div className="flex flex-wrap gap-2 items-center">
-                              <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mr-1.5">Sources:</span>
-                              {msg.citations.map((cite, cIdx) => (
-                                <button 
-                                  key={cIdx} 
-                                  onClick={() => handleCitationClick(cite, 'web')}
-                                  className="px-2.5 py-1 bg-white hover:bg-slate-50 border border-slate-200/80 hover:border-slate-300 text-slate-600 hover:text-slate-900 rounded-full text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer shadow-sm"
-                                  title={cite.url}
-                                >
-                                  <span className="inline-flex items-center justify-center w-3.5 h-3.5 text-[8px] font-black bg-slate-100 text-slate-600 rounded-full border border-slate-200">
-                                    {cIdx + 1}
-                                  </span>
-                                  <span className="max-w-[150px] truncate">{cite.text}</span>
-                                  <ExternalLink className="w-2.5 h-2.5 text-slate-400" />
-                                </button>
-                              ))}
-                            </div>
-                          )}
-
-                          {/* Database Citations */}
-                          {msg.dbCitations && msg.dbCitations.length > 0 && (
-                            <div className="flex flex-wrap gap-2 items-center">
-                              <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mr-1.5">Verified Database:</span>
-                              {msg.dbCitations.map((cite, cIdx) => {
-                                let isDimmed = false;
-                                if (lens !== 'comprehensive') {
-                                  if (lens === 'audits' && cite.type !== 'audit') isDimmed = true;
-                                  else if (lens === 'council' && cite.type !== 'council') isDimmed = true;
-                                  else if (lens === 'bills' && cite.type !== 'bill') isDimmed = true;
-                                  else if (lens === 'grants' && cite.type !== 'grant') isDimmed = true;
-                                }
-                                
-                                let colorClass = "bg-purple-50 hover:bg-purple-100/80 border-purple-200 text-purple-800";
-                                if (cite.type === 'council') {
-                                  colorClass = "bg-blue-50 hover:bg-blue-100/80 border-blue-200 text-blue-800";
-                                } else if (cite.type === 'bill') {
-                                  colorClass = "bg-rose-50 hover:bg-rose-100/80 border-rose-200 text-rose-800";
-                                } else if (cite.type === 'grant') {
-                                  colorClass = "bg-emerald-50 hover:bg-emerald-100/80 border-emerald-200 text-emerald-800";
-                                }
-
-                                return (
-                                  <button 
-                                    key={cIdx} 
-                                    onClick={() => handleCitationClick(cite, cite.type)}
-                                    className={`px-2.5 py-1 ${colorClass} border rounded-lg text-[11px] font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm ${isDimmed ? 'opacity-25' : ''}`}
-                                    title={cite.url}
-                                  >
-                                    <span className="inline-flex items-center justify-center px-1 text-[8px] font-black border rounded bg-white/70">
-                                      DB-{cIdx + 1}
-                                    </span>
-                                    <span className="max-w-[150px] truncate">{cite.text}</span>
-                                    <ExternalLink className="w-2.5 h-2.5 opacity-60" />
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-
-                          {/* Quick action suggestion chips */}
-                          {msg.suggestions && msg.suggestions.length > 0 && (
-                            <div className="flex flex-wrap gap-2">
-                              {msg.suggestions.map((sugg, sIdx) => (
-                                <button 
-                                  key={sIdx} 
-                                  onClick={() => handleSuggestionClick(sugg)}
-                                  className="px-3 py-1.5 bg-evergreen/5 hover:bg-evergreen/10 border border-evergreen/10 hover:border-evergreen/20 text-evergreen hover:text-emerald-800 rounded-lg text-xs font-bold transition-all cursor-pointer"
-                                >
-                                  {sugg}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                      <MessageBubble
+                        key={idx}
+                        msg={msg}
+                        idx={idx}
+                        lens={lens}
+                        handleCitationClick={handleCitationClick}
+                        handleSuggestionClick={handleSuggestionClick}
+                      />
+                    ))}
                   </div>
                 </div>
 
                 {/* Bottom Input Area */}
                 <div className="p-4 border-t border-slate-200/80 bg-white/75 backdrop-blur-md shrink-0">
-                  <form onSubmit={(e) => handleSubmit(e)} className="max-w-3xl mx-auto flex items-center gap-3 relative">
-                    <input 
-                      type="text" 
-                      className="w-full py-3.5 px-5 border border-slate-250 bg-slate-50 focus:bg-white focus:border-evergreen rounded-xl outline-none font-semibold text-slate-800 placeholder-slate-400 text-sm shadow-inner transition-colors"
-                      placeholder="Ask a follow up question or specify a new target..."
-                      value={query}
-                      onChange={e => setQuery(e.target.value)}
-                    />
-                    <button 
-                      type="submit" 
-                      className="p-3 bg-evergreen hover:bg-emerald-700 text-white rounded-xl transition-all cursor-pointer border-none shadow-md"
-                    >
-                      <Send className="w-4 h-4" />
-                    </button>
-                  </form>
+                  <SearchForm 
+                    onSubmit={(q) => handleSubmit(undefined, q)} 
+                    placeholder="Ask a follow up question or specify a new target..."
+                    showTypewriter={false}
+                    isFollowUp={true}
+                    className="max-w-3xl mx-auto"
+                  />
                 </div>
               </div>
             )}
@@ -1512,7 +1217,7 @@ export default function Dashboard() {
                 className="w-1.5 h-full cursor-col-resize hover:bg-evergreen/35 active:bg-evergreen/50 transition-colors z-30 relative select-none shrink-0 hidden lg:block bg-slate-200/50"
               />
               <aside 
-                style={{ width: `${explorerWidth}px` }}
+                style={{ width: 'var(--explorer-width, 320px)' }}
                 className="border-l border-slate-200/80 bg-white shrink-0 flex flex-col hidden lg:flex"
               >
                 <div className="p-4 border-b border-slate-200/80 flex items-center justify-between shrink-0 bg-slate-50/50">
@@ -1538,101 +1243,14 @@ export default function Dashboard() {
 
                 <div className="flex-1 overflow-y-auto p-4 custom-scrollbar flex flex-col gap-4 min-h-0 bg-slate-50/20">
                   {explorerTab === 'viewer' && selectedDocument ? (
-                    <div className="flex-1 flex flex-col space-y-4 h-full">
-                      {/* Document Meta card */}
-                      <div className="p-4 rounded-2xl bg-white border border-slate-200/80 space-y-3 shadow-sm relative overflow-hidden shrink-0">
-                        <div className="absolute top-0 right-0 h-1 w-12 bg-evergreen/40" />
-                        <div className="flex items-center gap-2">
-                          <span className={`text-[8px] font-black tracking-widest uppercase px-2 py-0.5 rounded border ${
-                            selectedDocument.type === 'audit' 
-                              ? 'bg-purple-50 text-purple-700 border-purple-200' 
-                              : selectedDocument.type === 'council' 
-                              ? 'bg-blue-50 text-blue-700 border-blue-200' 
-                              : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                          }`}>
-                            {selectedDocument.type === 'audit' ? 'SAO Audit File' : 
-                             selectedDocument.type === 'council' ? 'City Council Action' : 
-                             selectedDocument.type === 'bill' ? 'State Bill' :
-                             selectedDocument.type === 'grant' ? 'Grant Program' :
-                             'Web Reference'}
-                          </span>
-                        </div>
-                        <h4 className="text-xs md:text-sm font-extrabold text-slate-900 leading-snug">
-                          {selectedDocument.text}
-                        </h4>
-                        <a 
-                          href={selectedDocument.url} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center justify-center gap-2 w-full py-2.5 px-4 bg-evergreen hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-evergreen/10 cursor-pointer"
-                        >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                          <span>Open original document</span>
-                        </a>
-                      </div>
-
-                      {/* Preview Area */}
-                      <div className={`flex-1 min-h-[400px] border border-slate-200/80 rounded-2xl overflow-hidden bg-white shadow-inner flex flex-col relative group justify-center ${resizing ? 'pointer-events-none' : ''}`}>
-                        {(() => {
-                          // Extract report ID from URL or text
-                          let reportNum = '';
-                          const apiMatch = selectedDocument.url.match(/\/api\/v1\/documents\/sao\/([^\/]+)\/pdf/);
-                          const urlMatch = selectedDocument.url.match(/\b\d{7}\b/);
-                          const textMatch = selectedDocument.text.match(/\b\d{7}\b/);
-                          
-                          if (apiMatch) {
-                            reportNum = apiMatch[1];
-                          } else if (urlMatch) {
-                            reportNum = urlMatch[0];
-                          } else if (textMatch) {
-                            reportNum = textMatch[0];
-                          }
-
-                          if (reportNum) {
-                            return (
-                              <iframe 
-                                src={`/api/v1/documents/sao/${reportNum}/pdf#view=FitH`}
-                                className="w-full h-full border-none flex-1"
-                                title={selectedDocument.text}
-                              />
-                            );
-                          }
-
-                          if (selectedDocument.type === 'audit' || selectedDocument.url.endsWith('.pdf')) {
-                            return (
-                              <iframe 
-                                src={`https://docs.google.com/viewer?url=${encodeURIComponent(selectedDocument.url)}&embedded=true`}
-                                className="w-full h-full border-none flex-1"
-                                title={selectedDocument.text}
-                              />
-                            );
-                          }
-
-                          return (
-                            <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-400 bg-slate-50/50 space-y-4">
-                              <div className="p-3.5 bg-slate-100 rounded-full border border-slate-200/40 text-slate-400">
-                                <Building className="w-6 h-6" />
-                              </div>
-                              <div>
-                                <h5 className="text-xs font-black text-slate-800 uppercase tracking-wider">Web Reference</h5>
-                                <p className="text-[11px] text-slate-500 mt-2 max-w-[200px] leading-relaxed mx-auto font-medium">
-                                  This resource is an external search query or web page. Security headers typically restrict inline embedding.
-                                </p>
-                              </div>
-                              <a 
-                                href={selectedDocument.url} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold border border-slate-200 transition-all cursor-pointer shadow-sm"
-                              >
-                                <span>Open Web Source</span>
-                                <ExternalLink className="w-3.5 h-3.5" />
-                              </a>
-                            </div>
-                          );
-                        })()}
-                      </div>
-                    </div>
+                    <DocumentViewer
+                      selectedDocument={selectedDocument}
+                      onClose={() => {
+                        setExplorerTab('correlations');
+                        setSelectedDocument(null);
+                      }}
+                      resizing={resizing}
+                    />
                   ) : (
                     (() => {
                       const filteredCorrelations = activeCorrelations.filter(c => {
@@ -1646,58 +1264,11 @@ export default function Dashboard() {
                       
                       return filteredCorrelations.length > 0 ? (
                         filteredCorrelations.map((c, idx) => (
-                          <div 
+                          <CorrelationCard
                             key={idx}
-                            className="p-4 rounded-2xl glass hover:bg-white/90 hover:border-evergreen/25 space-y-3 shadow-sm relative overflow-hidden group transition-all duration-300 ease-out hover:-translate-y-0.5 hover:shadow-lg shrink-0"
-                          >
-                            <div className="absolute top-0 right-0 h-1 w-12 bg-evergreen/40" />
-                            <div className="flex justify-between items-start">
-                              <div>
-                                <div className="text-[10px] font-black uppercase text-evergreen tracking-wider">
-                                  {c.jurisdiction}
-                                </div>
-                                <div className="text-[9px] font-bold text-slate-400 mt-0.5 uppercase tracking-wide">
-                                  {c.category}
-                                </div>
-                              </div>
-                              {c.similarity && (
-                                <div className="text-[10px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
-                                  {Math.round(c.similarity * 100)}% Match
-                                </div>
-                              )}
-                            </div>
-
-                            <p className="text-xs text-slate-700 leading-relaxed font-medium">
-                              {c.summary}
-                            </p>
-
-                            {c.dollar_impact ? (
-                              <div className="text-xs font-bold text-rose-700 flex items-center gap-1 bg-rose-50 border border-rose-100 py-1 px-2.5 rounded-lg w-fit">
-                                <span>Financial impact: ${c.dollar_impact.toLocaleString()}</span>
-                              </div>
-                            ) : null}
-
-                            <div className="flex items-center gap-2 pt-1 shrink-0">
-                              <span className={`text-[8px] font-black tracking-widest uppercase px-2 py-0.5 rounded ${
-                                c.source === 'audit' ? 'bg-purple-50 text-purple-700 border border-purple-200' :
-                                c.source === 'council' ? 'bg-blue-50 text-blue-700 border border-blue-200' :
-                                c.source === 'bill' ? 'bg-rose-50 text-rose-700 border border-rose-200' :
-                                'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              }`}>
-                                {c.source === 'audit' ? 'SAO Audit' : 
-                                 c.source === 'council' ? 'City Council' : 
-                                 c.source === 'bill' ? 'State Bill' :
-                                 'Grant Program'}
-                              </span>
-                              <button 
-                                onClick={() => handleSuggestionClick(`Tell me more about the ${c.jurisdiction} ${c.category} findings.`)}
-                                className="text-[9px] font-black text-slate-500 hover:text-evergreen transition-colors uppercase ml-auto tracking-wider flex items-center gap-0.5 border-none bg-transparent cursor-pointer"
-                              >
-                                <span>Investigate</span>
-                                <ArrowRight className="w-2.5 h-2.5" />
-                              </button>
-                            </div>
-                          </div>
+                            correlation={c}
+                            onClickInvestigate={handleSuggestionClick}
+                          />
                         ))
                       ) : (
                         <div className="flex flex-col items-center justify-center text-center py-20 px-4 text-slate-400 space-y-3">
@@ -2224,6 +1795,18 @@ ${(selectedHomeCorr.citations || []).map((c: any, idx: number) => `[DB-${idx + 1
           </div>
         </div>
       )}
+
+      {/* Mobile/Tablet Document Viewer Slider Drawer */}
+      <div className="lg:hidden">
+        <DocumentViewer
+          selectedDocument={selectedDocument}
+          onClose={() => {
+            setExplorerTab('correlations');
+            setSelectedDocument(null);
+          }}
+          resizing={resizing}
+        />
+      </div>
     </div>
   );
 }
