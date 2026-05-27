@@ -2937,16 +2937,22 @@ Return ONLY a JSON list of strings, e.g. ["Question 1?", "Question 2?", "Questio
                 # Fallback path via Membrane Async Stream completions
                 try:
                     url = f"{membrane.base_url}/v1/chat/completions"
+                    messages = [{"role": "system", "content": system_prompt}]
+                    if history:
+                        for msg in history:
+                            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+                    messages.append({"role": "user", "content": query})
+                    
                     payload = {
                         "model": "membrane-engagement-layer",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": query}
-                        ],
+                        "messages": messages,
                         "temperature": 0.0,
                         "stream": True
                     }
-                    async with client.stream("POST", url, headers=membrane._headers(), json=payload, timeout=60.0) as response:
+                    extra_hdrs = {}
+                    if history:
+                        extra_hdrs["X-Membrane-Preserve-Context"] = "true"
+                    async with client.stream("POST", url, headers=membrane._headers(extra_hdrs), json=payload, timeout=60.0) as response:
                         async for line in response.aiter_lines():
                             if line.startswith("data: "):
                                 content = line[6:].strip()
@@ -3143,16 +3149,22 @@ CONTEXT DATABASE RECORDS:
                     yield f"data: {json.dumps({'status': 'synthesizing', 'message': 'Gemini API limit reached. Falling back to Membrane Engagement Layer...'})}\n\n"
                     try:
                         fallback_url = f"{membrane.base_url}/v1/chat/completions"
+                        fallback_messages = [{"role": "system", "content": system_prompt}]
+                        if history:
+                            for msg in history:
+                                fallback_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+                        fallback_messages.append({"role": "user", "content": query})
+                        
                         fallback_payload = {
                             "model": "membrane-engagement-layer",
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": query}
-                            ],
+                            "messages": fallback_messages,
                             "temperature": 0.0,
                             "stream": True
                         }
-                        async with client.stream("POST", fallback_url, headers=membrane._headers(), json=fallback_payload, timeout=60.0) as fallback_response:
+                        extra_hdrs = {}
+                        if history:
+                            extra_hdrs["X-Membrane-Preserve-Context"] = "true"
+                        async with client.stream("POST", fallback_url, headers=membrane._headers(extra_hdrs), json=fallback_payload, timeout=60.0) as fallback_response:
                             fallback_response.raise_for_status()
                             fallback_queue = asyncio.Queue()
                             
