@@ -102,12 +102,16 @@ const parseInlineMarkdown = (
           }
           
           let colorClass = "bg-emerald-50 border-emerald-300/30 text-emerald-800 hover:bg-emerald-100";
+          let pulseClass = "pulse-citation-grant";
           if (cite.type === 'audit') {
             colorClass = "bg-purple-50 border-purple-300/30 text-purple-800 hover:bg-purple-100";
+            pulseClass = "pulse-citation-audit";
           } else if (cite.type === 'council') {
             colorClass = "bg-blue-50 border-blue-300/30 text-blue-800 hover:bg-blue-100";
+            pulseClass = "pulse-citation-council";
           } else if (cite.type === 'bill') {
             colorClass = "bg-rose-50 border-rose-300/30 text-rose-800 hover:bg-rose-100";
+            pulseClass = "pulse-citation-bill";
           }
           
           subParts.push(
@@ -117,7 +121,7 @@ const parseInlineMarkdown = (
                 e.preventDefault();
                 onCitationClick(cite, cite.type);
               }}
-              className={`inline-flex items-center justify-center px-1.5 h-4.5 mx-0.5 text-[8px] font-black rounded border transition-all shadow-sm cursor-pointer align-super ${colorClass} ${isDimmed ? 'opacity-25' : ''}`}
+              className={`inline-flex items-center justify-center px-1.5 h-4.5 mx-0.5 text-[8px] font-black rounded border transition-all shadow-sm cursor-pointer align-super ${colorClass} ${pulseClass} ${isDimmed ? 'opacity-25' : ''}`}
               title={cite.text}
               type="button"
             >

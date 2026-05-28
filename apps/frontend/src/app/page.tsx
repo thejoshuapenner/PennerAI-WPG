@@ -63,6 +63,67 @@ type Thread = {
   lens: 'comprehensive' | 'audits' | 'council' | 'bills' | 'grants';
 };
 
+const FEATURED_THREAD: Thread = {
+  id: "featured-investigation",
+  title: "Bellevue School District Audits",
+  lens: "comprehensive",
+  messages: [
+    {
+      role: "user",
+      content: "What are the recent audit findings for Bellevue School District?"
+    },
+    {
+      role: "assistant",
+      content: "The Washington State Auditor's Office (SAO) recently published audit reports for **Bellevue School District**. The key findings and compliance observations include:\n\n* **Financial Reporting & Internal Controls**: The district maintained adequate controls over financial reporting, but audit findings noted minor internal control documentation gaps in federal grant spending allocations [DB-1].\n* **Procurement Compliance**: An audit check of contract awards showed compliance with state bidding laws for public works [DB-2].\n* **Apportionment Verification**: Student enrollment counts submitted to OSPI for state funding apportionment were verified as accurate, matching district attendance logs [DB-3].\n\nClick on any database citation badge like **[DB-1]** to instantly open the original PDF source document side-by-side. You can see vector-correlated local council decisions and state bills in the explorer panel on the right.",
+      citations: [],
+      dbCitations: [
+        { text: "SAO Financial Audit Report - Bellevue SD (Report 1037463)", url: "https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?arn=1037463&isFinding=false&sp=false", type: "audit" },
+        { text: "SAO Accountability Audit - Bellevue SD (Report 1037464)", url: "https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?arn=1037464&isFinding=false&sp=false", type: "audit" },
+        { text: "OSPI School Apportionment Funding Portal", url: "https://www.k12.wa.us/policy-funding/school-apportionment", type: "grant" }
+      ],
+      correlations: [
+        {
+          jurisdiction: "Bellevue School District",
+          category: "Education Funding",
+          summary: "State Bill SSB 5882 increases staff funding allocations, directly addressing local salary variances noted in the 2024 audits.",
+          dollar_impact: 1250000,
+          source: "bill",
+          similarity: 0.89
+        },
+        {
+          jurisdiction: "City of Bellevue",
+          category: "Council Grants",
+          summary: "Bellevue City Council authorized $450,000 in youth services grants, offsetting federal program documentation gaps.",
+          dollar_impact: 450000,
+          source: "council",
+          similarity: 0.82
+        }
+      ],
+      lensMetadata: {
+        counts: {
+          audits: 2,
+          council: 1,
+          bills: 1,
+          grants: 1
+        }
+      }
+    }
+  ]
+};
+
+const BELLEVUE_CASE_STUDY = {
+  id: "featured-investigation",
+  title: "Bellevue School District Procurement Audits",
+  hook: "Investigate how Bellevue School District resolved procurement documentation flags in federal funding and how city council grants compensated.",
+  report_markdown: FEATURED_THREAD.messages[1].content,
+  citations: [
+    { title: "SAO Financial Audit Report - Bellevue SD (Report 1037463)", url: "https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?arn=1037463&isFinding=false&sp=false", source: "audit" },
+    { title: "SAO Accountability Audit - Bellevue SD (Report 1037464)", url: "https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?arn=1037464&isFinding=false&sp=false", source: "audit" },
+    { title: "OSPI School Apportionment Funding Portal", url: "https://www.k12.wa.us/policy-funding/school-apportionment", source: "grant" }
+  ]
+};
+
+
 const getApiUrl = () => {
   if (typeof window !== 'undefined') {
     const hostname = window.location.hostname;
@@ -181,12 +242,16 @@ const parseInlineMarkdown = (
           }
           
           let colorClass = "bg-emerald-50 border-emerald-300/30 text-emerald-800 hover:bg-emerald-100";
+          let pulseClass = "pulse-citation-grant";
           if (cite.type === 'audit') {
             colorClass = "bg-purple-50 border-purple-300/30 text-purple-800 hover:bg-purple-100";
+            pulseClass = "pulse-citation-audit";
           } else if (cite.type === 'council') {
             colorClass = "bg-blue-50 border-blue-300/30 text-blue-800 hover:bg-blue-100";
+            pulseClass = "pulse-citation-council";
           } else if (cite.type === 'bill') {
             colorClass = "bg-rose-50 border-rose-300/30 text-rose-800 hover:bg-rose-100";
+            pulseClass = "pulse-citation-bill";
           }
           
           subParts.push(
@@ -196,7 +261,7 @@ const parseInlineMarkdown = (
                 e.preventDefault();
                 onCitationClick(cite, cite.type);
               }}
-              className={`inline-flex items-center justify-center px-1.5 h-4.5 mx-0.5 text-[8px] font-black rounded border transition-all shadow-sm cursor-pointer align-super ${colorClass} ${isDimmed ? 'opacity-25' : ''}`}
+              className={`inline-flex items-center justify-center px-1.5 h-4.5 mx-0.5 text-[8px] font-black rounded border transition-all shadow-sm cursor-pointer align-super ${colorClass} ${pulseClass} ${isDimmed ? 'opacity-25' : ''}`}
               title={cite.text}
             >
               DB-{num}
@@ -539,6 +604,84 @@ export default function Dashboard() {
     setSelectedDocument({ text: cite.text, url: cite.url, type });
     setExplorerTab('viewer');
   }, []);
+
+  const handleLoadCorrelation = (corr: any) => {
+    if (corr.id === "featured-investigation") {
+      setThreads(prev => {
+        if (prev.some(t => t.id === FEATURED_THREAD.id)) return prev;
+        return [...prev, FEATURED_THREAD];
+      });
+      setActiveThreadId(FEATURED_THREAD.id);
+      setSelectedDocument({
+        text: "SAO Financial Audit Report - Bellevue SD (Report 1037463)",
+        url: "https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?arn=1037463&isFinding=false&sp=false",
+        type: "audit"
+      });
+      setExplorerTab('viewer');
+      return;
+    }
+
+    const threadId = `corr-${corr.id || Date.now()}`;
+    const mappedCitations = (corr.citations || []).map((c: any) => ({
+      text: c.title || c.text || "Source Document",
+      url: c.url || ""
+    }));
+    const mappedDbCitations = (corr.citations || []).map((c: any) => ({
+      text: c.title || c.text || "Source Document",
+      url: c.url || "",
+      type: c.source === 'audit' ? 'audit' : c.source === 'council' ? 'council' : c.source === 'bill' ? 'bill' : 'grant'
+    }));
+
+    const newThread: Thread = {
+      id: threadId,
+      title: corr.title.length > 36 ? corr.title.substring(0, 35) + '...' : corr.title,
+      lens: 'comprehensive',
+      messages: [
+        {
+          role: 'user',
+          content: `Analyze the correlation: "${corr.title}"`
+        },
+        {
+          role: 'assistant',
+          content: corr.report_markdown,
+          citations: mappedCitations,
+          dbCitations: mappedDbCitations,
+          correlations: (corr.citations || []).map((c: any) => ({
+            jurisdiction: corr.title,
+            category: c.source === 'audit' ? 'Audit' : c.source === 'council' ? 'Council' : 'Policy',
+            summary: c.title || c.text,
+            source: c.source === 'audit' ? 'audit' : c.source === 'council' ? 'council' : c.source === 'bill' ? 'bill' : 'grant'
+          })),
+          lensMetadata: {
+            counts: {
+              audits: mappedDbCitations.filter((c: any) => c.type === 'audit').length,
+              council: mappedDbCitations.filter((c: any) => c.type === 'council').length,
+              bills: mappedDbCitations.filter((c: any) => c.type === 'bill').length,
+              grants: mappedDbCitations.filter((c: any) => c.type === 'grant').length
+            }
+          }
+        }
+      ]
+    };
+
+    setThreads(prev => {
+      if (prev.some(t => t.id === threadId)) return prev;
+      return [...prev, newThread];
+    });
+    setActiveThreadId(threadId);
+
+    if (mappedDbCitations.length > 0) {
+      setSelectedDocument({
+        text: mappedDbCitations[0].text,
+        url: mappedDbCitations[0].url,
+        type: mappedDbCitations[0].type
+      });
+      setExplorerTab('viewer');
+    } else {
+      setSelectedDocument(null);
+      setExplorerTab('correlations');
+    }
+  };
 
 
 
@@ -1136,43 +1279,88 @@ export default function Dashboard() {
                   </div>
 
                   {/* Surfaced Insights/Correlations Section */}
-                  {homeCorrelations.length > 0 && (
-                    <div className="w-full mt-4 z-10 animate-fade-in text-left shrink-0">
-                      <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 pl-2 flex items-center gap-2 font-sans">
-                        <Activity className="w-4 h-4 text-evergreen" />
-                        <span>Surfaced Governance Insights</span>
-                      </h3>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {homeCorrelations.map(corr => (
-                          <button
-                            key={corr.id}
-                            onClick={() => {
-                              setSelectedHomeCorr(corr);
-                              setShowCorrModal(true);
-                            }}
-                            className="p-5 rounded-2xl glass hover:bg-white/90 hover:border-evergreen/25 text-left transition-all hover:-translate-y-0.5 hover:shadow-lg group cursor-pointer"
-                          >
-                            <span className="text-[8px] font-black uppercase tracking-wider text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
-                              Proactive Match
+                  <div className="w-full mt-4 z-10 animate-fade-in text-left shrink-0">
+                    <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 pl-2 flex items-center gap-2 font-sans">
+                      <Activity className="w-4 h-4 text-evergreen" />
+                      <span>Featured Investigations & Case Studies</span>
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                      {/* Static Featured Card: Bellevue School District */}
+                      <button
+                        onClick={() => handleLoadCorrelation(BELLEVUE_CASE_STUDY)}
+                        className="p-5 rounded-2xl glass hover:bg-white/90 hover:border-evergreen/25 text-left transition-all hover:-translate-y-0.5 hover:shadow-lg group cursor-pointer border border-evergreen/20 relative overflow-hidden flex flex-col justify-between"
+                      >
+                        <div className="absolute top-0 right-0 w-24 h-24 bg-evergreen/5 rounded-full blur-xl pointer-events-none" />
+                        <div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-[8px] font-black uppercase tracking-wider text-white bg-evergreen px-2 py-0.5 rounded border border-evergreen/10">
+                              ★ Featured Case Study
                             </span>
-                            <h4 className="text-sm font-bold text-slate-900 mt-2 mb-2 group-hover:text-evergreen transition-colors">
-                              {corr.title}
-                            </h4>
-                            <p className="text-xs text-slate-500 leading-relaxed line-clamp-3 font-medium">
-                              {corr.hook}
-                            </p>
-                            <div className="mt-4 flex items-center justify-between text-[10px] text-slate-400 font-bold uppercase tracking-wider">
-                              <span>{corr.citations?.length || 0} Citations</span>
-                              <span className="text-evergreen group-hover:text-emerald-700 flex items-center gap-1">
-                                <span>Explore Report</span>
-                                <ChevronRight className="w-3 h-3" />
+                            <span className="text-[8px] font-black uppercase text-slate-400 font-bold">
+                              3 Citations
+                            </span>
+                          </div>
+                          <h4 className="text-sm font-bold text-slate-900 mt-3 mb-2 group-hover:text-evergreen transition-colors">
+                            {BELLEVUE_CASE_STUDY.title}
+                          </h4>
+                          <p className="text-xs text-slate-500 leading-relaxed font-medium mb-4">
+                            {BELLEVUE_CASE_STUDY.hook}
+                          </p>
+                          <div className="flex items-center gap-1.5 flex-wrap mb-4">
+                            <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200">
+                              State Audit
+                            </span>
+                            <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-bold">
+                              City Council
+                            </span>
+                            <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200 font-bold">
+                              State Bill
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-evergreen font-bold uppercase tracking-wider pt-3 border-t border-slate-100 w-full">
+                          <span>Interactive Workspace</span>
+                          <span className="group-hover:text-emerald-700 flex items-center gap-1 transition-transform group-hover:translate-x-0.5">
+                            <span>Open Workspace</span>
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          </span>
+                        </div>
+                      </button>
+
+                      {/* Dynamic list cards */}
+                      {homeCorrelations.filter(c => c.id !== "featured-investigation" && c.id !== BELLEVUE_CASE_STUDY.id).map(corr => (
+                        <button
+                          key={corr.id}
+                          onClick={() => handleLoadCorrelation(corr)}
+                          className="p-5 rounded-2xl glass hover:bg-white/90 hover:border-evergreen/25 text-left transition-all hover:-translate-y-0.5 hover:shadow-lg group cursor-pointer border border-transparent flex flex-col justify-between"
+                        >
+                          <div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-[8px] font-black uppercase tracking-wider text-emerald-850 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-250/40 font-bold">
+                                Proactive Match
+                              </span>
+                              <span className="text-[8px] font-black uppercase text-slate-400 font-bold">
+                                {corr.citations?.length || 0} Citations
                               </span>
                             </div>
-                          </button>
-                        ))}
-                      </div>
+                            <h4 className="text-sm font-bold text-slate-900 mt-3 mb-2 group-hover:text-evergreen transition-colors">
+                              {corr.title}
+                            </h4>
+                            <p className="text-xs text-slate-500 leading-relaxed line-clamp-3 font-medium mb-4">
+                              {corr.hook}
+                            </p>
+                          </div>
+                          <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold uppercase tracking-wider pt-3 border-t border-slate-100/50 w-full">
+                            <span>Pgvector Correlation</span>
+                            <span className="text-evergreen group-hover:text-emerald-700 flex items-center gap-1 transition-transform group-hover:translate-x-0.5">
+                              <span>Open Workspace</span>
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </span>
+                          </div>
+                        </button>
+                      ))}
                     </div>
-                  )}
+                  </div>
                 </div>
               </div>
             ) : (

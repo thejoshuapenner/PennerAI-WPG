@@ -714,7 +714,23 @@ School boards and city councils have approved contracts to begin these projects.
 def get_verbatim_context_for_citation(cit: dict) -> str:
     import re
     source = cit.get("source")
-    cit_id = str(cit.get("id") or "")
+    cit_id = str(cit.get("id") or "").strip()
+    
+    # Strip common prefixes from IDs to prevent mismatches
+    if cit_id.lower().startswith("audit "):
+        cit_id = cit_id[6:].strip()
+    elif cit_id.lower().startswith("budget "):
+        cit_id = cit_id[7:].strip()
+    elif cit_id.lower().startswith("school "):
+        cit_id = cit_id[7:].strip()
+    elif cit_id.lower().startswith("grant "):
+        cit_id = cit_id[6:].strip()
+    elif cit_id.lower().startswith("contribution "):
+        cit_id = cit_id[13:].strip()
+    elif cit_id.lower().startswith("bill "):
+        cit_id = cit_id[5:].strip()
+    elif cit_id.lower().startswith("event "):
+        cit_id = cit_id[6:].strip()
     
     if source == "audit":
         for db_name in ["sao_audits.db", "sao_2024.db"]:
@@ -759,16 +775,44 @@ def get_verbatim_context_for_citation(cit: dict) -> str:
             try:
                 cur = conn.cursor()
                 if cit_id.isdigit():
+                    # Try budget item ID first
+                    cur.execute(
+                        """
+                        SELECT b.jurisdiction_name, b.fiscal_year, b.total_revenue, b.total_expenditures,
+                               bi.major_category, bi.amount, bi.description
+                        FROM budget_items bi
+                        JOIN budgets b ON bi.budget_id = b.id
+                        WHERE bi.id = ?
+                        """,
+                        (int(cit_id),)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        val = f"Budget for {row[0]} ({row[1]}) - {row[4]}: {row[6] or 'Allocation'}. Item Amount: ${row[5]:,}. (Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,})"
+                        cur.close()
+                        conn.close()
+                        return val
+                    
+                    # Fallback to entire budget ID
                     cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures FROM budgets WHERE id = ?", (int(cit_id),))
+                    row = cur.fetchone()
+                    if row:
+                        val = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                        cur.close()
+                        conn.close()
+                        return val
                 else:
                     clean_search = re.sub(r'[^a-zA-Z\s]', '', cit_id).split()
                     search_val = f"%{clean_search[0]}%" if clean_search else f"%{cit_id}%"
                     cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures FROM budgets WHERE jurisdiction_name LIKE ? OR ? LIKE '%' || jurisdiction_name || '%'", (search_val, cit_id))
-                row = cur.fetchone()
+                    row = cur.fetchone()
+                    if row:
+                        val = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                        cur.close()
+                        conn.close()
+                        return val
                 cur.close()
                 conn.close()
-                if row:
-                    return f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
             except Exception:
                 pass
                 
@@ -859,199 +903,941 @@ def get_verbatim_context_for_citation(cit: dict) -> str:
                 
     return f"Details for {source} citation with ID {cit_id}."
 
+def fetch_pivots(conn, limit=5):
+    """
+    Fetches recent records from findings, merged_actions, grants to use as seed pivots.
+    """
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    pivots = []
+    
+    internal_limit = 30
+    
+    # 1. Recent findings
+    try:
+        cur.execute(
+            """
+            SELECT 'audit' as pivot_type, report_num as id, jurisdiction, summary as text, embedding, year
+            FROM findings
+            WHERE embedding IS NOT NULL
+            ORDER BY report_num DESC
+            LIMIT %s
+            """,
+            (internal_limit,)
+        )
+        pivots.extend([dict(r) for r in cur.fetchall()])
+    except Exception as e:
+        print("Error fetching audit pivots:", e)
+        conn.rollback()
+        
+    # 2. Recent merged_actions
+    try:
+        cur.execute(
+            """
+            SELECT 'council' as pivot_type, event_id as id, jurisdiction, key_action as text, embedding, meeting_date
+            FROM merged_actions
+            WHERE embedding IS NOT NULL AND meeting_date != 'Extracted_Date'
+              AND lower(key_action) NOT LIKE '%call to order%'
+              AND lower(key_action) NOT LIKE '%roll call%'
+              AND lower(key_action) NOT LIKE '%approval of minutes%'
+              AND lower(key_action) NOT LIKE '%public comment%'
+              AND lower(key_action) NOT LIKE '%adjourn%'
+            ORDER BY meeting_date DESC, event_id DESC
+            LIMIT %s
+            """,
+            (internal_limit,)
+        )
+        pivots.extend([dict(r) for r in cur.fetchall()])
+    except Exception as e:
+        print("Error fetching council pivots:", e)
+        conn.rollback()
+
+    # 3. Recent grants
+    try:
+        cur.execute(
+            """
+            SELECT 'grant' as pivot_type, id, recipient_jurisdiction as jurisdiction, grant_title as text, embedding, award_date
+            FROM grants
+            WHERE embedding IS NOT NULL
+            ORDER BY award_date DESC NULLS LAST, id DESC
+            LIMIT %s
+            """,
+            (internal_limit,)
+        )
+        pivots.extend([dict(r) for r in cur.fetchall()])
+    except Exception as e:
+        print("Error fetching grant pivots:", e)
+        conn.rollback()
+
+    import random
+    random.shuffle(pivots)
+    return pivots[:limit]
+
+def fetch_semantic_candidates_for_pivot(embedding, jurisdiction_name, conn, limit=3, threshold=0.28):
+    """
+    Given a pivot's embedding and jurisdiction, queries all other tables for
+    semantically similar records.
+    """
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    matches = {}
+    
+    # Clean jurisdiction name for ILIKE searches (e.g. "Seattle" instead of "City of Seattle")
+    jur_clean = jurisdiction_name.upper().replace("CITY OF", "").replace("COUNTY", "").strip()
+    jur_pattern = f"%{jur_clean}%" if jur_clean else "%"
+    
+    # 1. findings
+    try:
+        cur.execute(
+            """
+            SELECT report_num, jurisdiction, category, summary, dollar_impact, year,
+                   (embedding <=> %s::vector) as distance
+            FROM findings
+            WHERE jurisdiction ILIKE %s AND (embedding <=> %s::vector) < %s
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (embedding, jur_pattern, embedding, threshold, limit)
+        )
+        matches["audit"] = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching semantic audits:", e)
+        conn.rollback()
+
+    # 2. merged_actions (council)
+    try:
+        cur.execute(
+            """
+            SELECT event_id, jurisdiction, committee, meeting_date, key_action, dollar_amount,
+                   (embedding <=> %s::vector) as distance
+            FROM merged_actions
+            WHERE jurisdiction ILIKE %s AND (embedding <=> %s::vector) < %s
+              AND meeting_date != 'Extracted_Date'
+              AND lower(key_action) NOT LIKE '%call to order%'
+              AND lower(key_action) NOT LIKE '%roll call%'
+              AND lower(key_action) NOT LIKE '%approval of minutes%'
+              AND lower(key_action) NOT LIKE '%public comment%'
+              AND lower(key_action) NOT LIKE '%adjourn%'
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (embedding, jur_pattern, embedding, threshold, limit)
+        )
+        matches["council"] = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching semantic council actions:", e)
+        conn.rollback()
+
+    # 3. budgets / budget_items
+    try:
+        cur.execute(
+            """
+            SELECT bi.id, b.jurisdiction_name, b.entity_type, b.fiscal_year, b.total_revenue, b.total_expenditures,
+                   bi.major_category, bi.amount as item_amount, bi.description,
+                   (bi.embedding <=> %s::vector) as distance
+            FROM budget_items bi
+            JOIN budgets b ON bi.budget_id = b.id
+            WHERE b.jurisdiction_name ILIKE %s AND (bi.embedding <=> %s::vector) < %s
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (embedding, jur_pattern, embedding, threshold, limit)
+        )
+        matches["budget"] = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching semantic budget items:", e)
+        conn.rollback()
+
+    # 4. grants
+    try:
+        cur.execute(
+            """
+            SELECT id, source_url, grant_title, awarding_agency, recipient_jurisdiction, award_amount, award_date, purpose_category, funding_source,
+                   (embedding <=> %s::vector) as distance
+            FROM grants
+            WHERE recipient_jurisdiction ILIKE %s AND (embedding <=> %s::vector) < %s
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (embedding, jur_pattern, embedding, threshold, limit)
+        )
+        matches["grant"] = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching semantic grants:", e)
+        conn.rollback()
+
+    # 5. school_district_financials (school)
+    try:
+        cur.execute(
+            """
+            SELECT id, source_url, district_name, fiscal_year, enrollment, total_revenue, total_expenditures, levy_amount, special_education_spending, federal_funding_amount,
+                   (embedding <=> %s::vector) as distance
+            FROM school_district_financials
+            WHERE district_name ILIKE %s AND (embedding <=> %s::vector) < %s
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (embedding, jur_pattern, embedding, threshold, limit)
+        )
+        matches["school"] = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching semantic school financials:", e)
+        conn.rollback()
+
+    return matches
+
+def fetch_contributions_for_jurisdiction(jurisdiction_name, conn, limit=5):
+    """
+    Fetch significant campaign contributions for a given jurisdiction.
+    """
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    jur_clean = jurisdiction_name.upper().replace("CITY OF", "").replace("COUNTY", "").strip()
+    jur_pattern = f"%{jur_clean}%" if jur_clean else "%"
+    try:
+        cur.execute(
+            """
+            SELECT id, candidate_name, contributor_name, contributor_employer, amount, receipt_date, jurisdiction, source_url
+            FROM political_contributions
+            WHERE (jurisdiction ILIKE %s OR candidate_name ILIKE %s)
+              AND amount >= 1000
+            ORDER BY receipt_date DESC NULLS LAST, id DESC
+            LIMIT %s
+            """,
+            (jur_pattern, jur_pattern, limit)
+        )
+        return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching contributions for jurisdiction:", e)
+        conn.rollback()
+    return []
+
+def fetch_relevant_bills(pivot_text, conn, limit=3):
+    """
+    Find legislative bills that match terms in the pivot text.
+    """
+    import re
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    keywords = [w for w in re.sub(r'[^a-zA-Z\s]', '', pivot_text).split() if len(w) > 4][:5]
+    if not keywords:
+        keywords = ["Administration"]
+        
+    like_clauses = " OR ".join(["title ILIKE %s" for _ in keywords])
+    params = [f"%{w}%" for w in keywords]
+    
+    try:
+        cur.execute(
+            f"""
+            SELECT bill_number, title, biennium, sponsor, passed_date, summary, policy_category
+            FROM legislative_bills
+            WHERE {like_clauses}
+            ORDER BY passed_date DESC NULLS LAST, bill_number DESC
+            LIMIT %s
+            """,
+            (*params, limit)
+        )
+        return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print("Error fetching relevant bills:", e)
+        conn.rollback()
+    return []
+
+def get_keywords(text: str):
+    import re
+    if not text:
+        return []
+    words = re.sub(r'[^a-zA-Z0-9\s]', '', text.lower()).split()
+    stop_words = {
+        "the", "and", "a", "for", "to", "of", "with", "that", "this", "on", "in", "at", "by", 
+        "from", "an", "is", "was", "were", "are", "be", "been", "have", "has", "had", "do", 
+        "does", "did", "but", "or", "as", "if", "then", "else", "when", "where", "why", "how", 
+        "not", "no", "yes", "our", "their", "your", "its", "about", "which", "who", "whom", 
+        "orting", "enumclaw", "tacoma", "seattle", "spokane", "olympia", "washington", "state",
+        "county", "city", "district", "meeting", "minutes", "council", "board", "committee",
+        "action", "passed", "failed", "agenda", "item", "report", "finding"
+    }
+    keywords = [w for w in words if w not in stop_words and len(w) > 4]
+    return sorted(list(set(keywords)), key=len, reverse=True)[:5]
+
+def search_audits_sqlite(jur_pattern, keywords, limit=3):
+    results = []
+    for db_name in ["sao_audits.db", "sao_2024.db"]:
+        conn = get_sqlite_conn(db_name)
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT report_num, jurisdiction, category, summary, dollar_impact, year, verbatim_text_context, source_url
+                    FROM findings
+                    WHERE jurisdiction LIKE ?
+                    """,
+                    (jur_pattern,)
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                results.extend(rows)
+                conn.close()
+            except Exception as e:
+                print(f"Error searching audits in SQLite {db_name}: {e}")
+    
+    scored = []
+    for r in results:
+        score = 0
+        summary = ((r.get("summary") or "") + " " + (r.get("category") or "")).lower()
+        for kw in keywords:
+            if kw in summary:
+                score += 1
+        scored.append((score, r))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
+
+def search_council_sqlite(jur_pattern, keywords, limit=3):
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT event_id, jurisdiction, doc_type as committee, meeting_date, key_action, agenda_item_title, dollar_amount, verbatim_text_context
+            FROM processed_intent
+            WHERE jurisdiction LIKE ?
+              AND meeting_date != 'Extracted_Date'
+              AND key_action IS NOT NULL
+              AND (agenda_item_title IS NULL OR (
+                  lower(agenda_item_title) NOT LIKE '%call to order%'
+                  AND lower(agenda_item_title) NOT LIKE '%roll call%'
+                  AND lower(agenda_item_title) NOT LIKE '%approval of minutes%'
+                  AND lower(agenda_item_title) NOT LIKE '%public comment%'
+                  AND lower(agenda_item_title) NOT LIKE '%excuse%'
+                  AND lower(agenda_item_title) NOT LIKE '%adjourn%'
+              ))
+            """,
+            (jur_pattern,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        
+        scored = []
+        for r in rows:
+            score = 0
+            text = ((r.get("key_action") or "") + " " + (r.get("agenda_item_title") or "")).lower()
+            for kw in keywords:
+                if kw in text:
+                    score += 1
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        final_rows = []
+        for item in scored[:limit]:
+            r = item[1]
+            r["key_action"] = clean_summary_text(r.get("agenda_item_title"), r.get("key_action"))
+            final_rows.append(r)
+        return final_rows
+    except Exception as e:
+        print(f"Error searching council in SQLite: {e}")
+        return []
+
+def search_budgets_sqlite(jur_pattern, keywords, limit=3):
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT bi.id, b.jurisdiction_name, b.entity_type, b.fiscal_year, b.total_revenue, b.total_expenditures,
+                   bi.major_category, bi.amount as item_amount, bi.description
+            FROM budget_items bi
+            JOIN budgets b ON bi.budget_id = b.id
+            WHERE b.jurisdiction_name LIKE ?
+            """,
+            (jur_pattern,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        
+        scored = []
+        for r in rows:
+            score = 0
+            desc = ((r.get("description") or "") + " " + (r.get("major_category") or "")).lower()
+            for kw in keywords:
+                if kw in desc:
+                    score += 1
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in scored[:limit]]
+    except Exception as e:
+        print(f"Error searching budgets in SQLite: {e}")
+        return []
+
+def search_grants_sqlite(jur_pattern, keywords, limit=3):
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, source_url, grant_title, awarding_agency, recipient_jurisdiction, award_amount, award_date, purpose_category, funding_source
+            FROM grants
+            WHERE recipient_jurisdiction LIKE ?
+            """,
+            (jur_pattern,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        
+        scored = []
+        for r in rows:
+            score = 0
+            title = (r.get("grant_title") or "").lower()
+            for kw in keywords:
+                if kw in title:
+                    score += 1
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in scored[:limit]]
+    except Exception as e:
+        print(f"Error searching grants in SQLite: {e}")
+        return []
+
+def search_schools_sqlite(jur_clean, keywords, limit=3):
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        pattern = f"%{jur_clean}%"
+        cur.execute(
+            """
+            SELECT id, source_url, district_name, fiscal_year, enrollment, total_revenue, total_expenditures, levy_amount, special_education_spending, federal_funding_amount
+            FROM school_district_financials
+            WHERE district_name LIKE ?
+            """,
+            (pattern,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        
+        scored = []
+        for r in rows:
+            score = 0
+            name = (r.get("district_name") or "").lower()
+            for kw in keywords:
+                if kw in name:
+                    score += 1
+            scored.append((score, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in scored[:limit]]
+    except Exception as e:
+        print(f"Error searching school financials in SQLite: {e}")
+        return []
+
+def fetch_pivots_sqlite(limit=5):
+    """
+    Fetches recent records from findings, processed_intent, grants in SQLite to use as seed pivots,
+    filtering out already cited ones.
+    """
+    try:
+        cited = get_already_cited_records()
+    except Exception:
+        cited = {}
+        
+    audit_pivots = []
+    council_pivots = []
+    grant_pivots = []
+    
+    # 1. Recent findings from sao_audits.db and sao_2024.db
+    for db_name in ["sao_audits.db", "sao_2024.db"]:
+        conn = get_sqlite_conn(db_name)
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT 'audit' as pivot_type, report_num as id, jurisdiction, summary as text, year
+                    FROM findings
+                    ORDER BY year DESC, report_num DESC
+                    LIMIT 100
+                    """
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    if str(r["id"]) not in cited.get("audit", set()):
+                        audit_pivots.append(r)
+                conn.close()
+            except Exception as e:
+                print(f"Error fetching audit pivots from SQLite {db_name}: {e}")
+
+    # Deduplicate audit pivots by ID
+    unique_audit = []
+    seen_audit = set()
+    for ap in audit_pivots:
+        if ap["id"] not in seen_audit:
+            seen_audit.add(ap["id"])
+            unique_audit.append(ap)
+    audit_pivots = unique_audit[:30]
+
+    # 2. Recent council actions from municipal_intent.db (processed_intent)
+    conn = get_sqlite_conn("municipal_intent.db")
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT 'council' as pivot_type, event_id as id, jurisdiction, key_action as text, meeting_date
+                FROM processed_intent
+                WHERE meeting_date != 'Extracted_Date'
+                  AND key_action IS NOT NULL
+                  AND (agenda_item_title IS NULL OR (
+                      lower(agenda_item_title) NOT LIKE '%call to order%'
+                      AND lower(agenda_item_title) NOT LIKE '%roll call%'
+                      AND lower(agenda_item_title) NOT LIKE '%approval of minutes%'
+                      AND lower(agenda_item_title) NOT LIKE '%public comment%'
+                      AND lower(agenda_item_title) NOT LIKE '%excuse%'
+                      AND lower(agenda_item_title) NOT LIKE '%adjourn%'
+                  ))
+                ORDER BY meeting_date DESC
+                LIMIT 200
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                if str(r["id"]) not in cited.get("council", set()):
+                    council_pivots.append(r)
+            
+            # Deduplicate council pivots by ID (since multiple rows share event_id)
+            unique_council = []
+            seen_council = set()
+            for cp in council_pivots:
+                if cp["id"] not in seen_council:
+                    seen_council.add(cp["id"])
+                    unique_council.append(cp)
+            council_pivots = unique_council[:30]
+
+            # 3. Recent grants from municipal_intent.db (grants)
+            cur.execute(
+                """
+                SELECT 'grant' as pivot_type, id, recipient_jurisdiction as jurisdiction, grant_title as text, award_date
+                FROM grants
+                ORDER BY award_date DESC
+                LIMIT 100
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                if str(r["id"]) not in cited.get("grant", set()):
+                    grant_pivots.append(r)
+            grant_pivots = grant_pivots[:30]
+            
+            conn.close()
+        except Exception as e:
+            print("Error fetching council/grant pivots from SQLite municipal_intent.db:", e)
+            
+    # Combine and return a diverse slice of pivots
+    pivots = []
+    pivots.extend(audit_pivots)
+    pivots.extend(council_pivots)
+    pivots.extend(grant_pivots)
+    import random
+    random.shuffle(pivots)
+    return pivots[:limit]
+
+def fetch_candidates_for_pivot_sqlite(pivot, limit=3):
+    """
+    Given a pivot's text and jurisdiction, queries SQLite tables for
+    semantically/geographically matching records using keyword overlap.
+    """
+    jurisdiction_name = pivot.get("jurisdiction") or ""
+    pivot_text = pivot.get("text") or ""
+    
+    jur_clean = jurisdiction_name.upper().replace("CITY OF", "").replace("COUNTY", "").strip()
+    jur_pattern = f"%{jur_clean}%" if jur_clean else "%"
+    
+    keywords = get_keywords(pivot_text)
+    print(f"    SQLite candidate search keywords: {keywords}")
+    
+    matches = {
+        "audit": search_audits_sqlite(jur_pattern, keywords, limit),
+        "council": search_council_sqlite(jur_pattern, keywords, limit),
+        "budget": search_budgets_sqlite(jur_pattern, keywords, limit),
+        "grant": search_grants_sqlite(jur_pattern, keywords, limit),
+        "school": search_schools_sqlite(jur_clean, keywords, limit)
+    }
+    return matches
+
+def fetch_contributions_for_jurisdiction_sqlite(jurisdiction_name, limit=5):
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    jur_clean = jurisdiction_name.upper().replace("CITY OF", "").replace("COUNTY", "").strip()
+    jur_pattern = f"%{jur_clean}%" if jur_clean else "%"
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, candidate_name, contributor_name, contributor_employer, amount, receipt_date, jurisdiction
+            FROM political_contributions
+            WHERE (jurisdiction LIKE ? OR candidate_name LIKE ?)
+              AND amount >= 1000
+            ORDER BY receipt_date DESC, id DESC
+            LIMIT ?
+            """,
+            (jur_pattern, jur_pattern, limit)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print("Error fetching contributions for jurisdiction in SQLite:", e)
+        return []
+
+def fetch_relevant_bills_sqlite(pivot_text, limit=3):
+    import re
+    conn = get_sqlite_conn("municipal_intent.db")
+    if not conn:
+        return []
+    keywords = [w for w in re.sub(r'[^a-zA-Z\s]', '', pivot_text).split() if len(w) > 4][:5]
+    if not keywords:
+        keywords = ["Administration"]
+        
+    like_clauses = " OR ".join(["title LIKE ?" for _ in keywords])
+    params = [f"%{w}%" for w in keywords]
+    
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT bill_number, title, biennium, sponsor, passed_date, summary, policy_category
+            FROM legislative_bills
+            WHERE {like_clauses}
+            ORDER BY passed_date DESC, bill_number DESC
+            LIMIT ?
+            """,
+            (*params, limit)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print("Error fetching relevant bills in SQLite:", e)
+        return []
+
 def generate_correlations():
-    """Generates 2-3 correlation reports and saves them to the DB as proposed."""
-    print("🤖 Starting AI Correlation Generation...")
+    """Generates 2-3 correlation reports using semantic vector-matching and a skeptical critic evaluator loop."""
+    print("🤖 Starting Upgraded Intelligent Semantic Correlation Generation...")
     
-    findings, actions, budgets, grants, school_financials, contributions, bills = fetch_recent_data()
-    print(f"  Retrieved {len(findings)} audits, {len(actions)} council actions, {len(budgets)} budgets, {len(grants)} grants, {len(school_financials)} school records, {len(contributions)} campaign contributions, and {len(bills)} legislative bills from database.")
-    
-    # If DB is empty, use realistic fallback mock data to seed
-    if (len(findings) < 2 and len(budgets) < 2) or not GEMINI_API_KEY:
-        print("  Insufficient database context or GEMINI_API_KEY missing. Seeding fallback mock correlations.")
+    if not GEMINI_API_KEY:
+        print("  GEMINI_API_KEY missing. Seeding fallback mock correlations.")
         fallbacks = get_fallback_correlations()
-        ids = []
-        for f in fallbacks:
-            row_id = save_correlation(f)
-            ids.append(row_id)
+        ids = [save_correlation(f) for f in fallbacks]
         return {"status": "success", "source": "mock_fallbacks", "generated_ids": ids}
+
+    # Try to connect to PostgreSQL
+    try:
+        conn = get_pg_conn()
+        use_postgres = True
+        print("  Connected to PostgreSQL database.")
+    except Exception as e:
+        print("  Postgres connection failed for upgraded engine. Falling back to live SQLite database:", e)
+        use_postgres = False
+        conn = None
+
+    # 1. Fetch seed pivots
+    if use_postgres:
+        pivots = fetch_pivots(conn, limit=5)
+        print(f"  Retrieved {len(pivots)} seed pivots from PostgreSQL.")
+    else:
+        pivots = fetch_pivots_sqlite(limit=5)
+        print(f"  Retrieved {len(pivots)} seed pivots from SQLite.")
+    
+    if not pivots:
+        print("  No pivots found.")
+        if conn:
+            conn.close()
+        return {"status": "success", "source": "no_pivots", "generated_ids": []}
+
+    membrane = MembraneClient()
+    validated_correlations = []
+    generated_count = 0
+    target_count = 2 # Generate 2 high-quality correlations
+
+    # Load already-cited records to avoid duplicate correlations
+    try:
+        cited = get_already_cited_records()
+    except Exception:
+        cited = {}
+
+    for pivot in pivots:
+        if generated_count >= target_count:
+            break
+            
+        pivot_type = pivot["pivot_type"]
+        pivot_id = str(pivot["id"])
         
-    # Format inputs for LLM
-    findings_text = ""
-    for f in findings[:15]:
-        year_str = f.get("year", "2025")
-        findings_text += f"- [Audit {f['report_num']}] Jurisdiction: {f['jurisdiction']} | Year: {year_str} | Category: {f['category']} | Summary: {f['summary']} | Impact: ${f['dollar_impact']:,} | URL: https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber={f['report_num']}\n"
+        # Skip if pivot was already cited
+        if pivot_id in cited.get(pivot_type, set()):
+            continue
+            
+        print(f"\n  === Processing Pivot: {pivot_type} ID: {pivot_id} ({pivot['jurisdiction']}) ===")
         
-    actions_text = ""
-    for a in actions[:15]:
-        actions_text += f"- [Event {a['event_id']}] Jurisdiction: {a['jurisdiction']} | Committee: {a['committee']} | Description: {a['key_action']} | Amount: ${a['dollar_amount']:,} | URL: {a.get('source_url') or 'https://municipal-intent-search'}\n"
+        # 2. Query other tables for semantic matches
+        if use_postgres:
+            matches = fetch_semantic_candidates_for_pivot(pivot["embedding"], pivot["jurisdiction"], conn)
+        else:
+            matches = fetch_candidates_for_pivot_sqlite(pivot, limit=3)
+        
+        # Format candidate matches
+        findings_text = ""
+        actions_text = ""
+        budgets_text = ""
+        grants_text = ""
+        schools_text = ""
+        
+        audit_matches = [f for f in matches.get("audit", []) if str(f["report_num"]) != pivot_id]
+        for f in audit_matches:
+            findings_text += f"- [Audit {f['report_num']}] Jurisdiction: {f['jurisdiction']} | Year: {f['year']} | Category: {f['category']} | Summary: {f['summary']} | Impact: ${f['dollar_impact']:,} | URL: https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber={f['report_num']}\n"
+            
+        council_matches = [a for a in matches.get("council", []) if str(a["event_id"]) != pivot_id]
+        for a in council_matches:
+            actions_text += f"- [Event {a['event_id']}] Jurisdiction: {a['jurisdiction']} | Committee: {a['committee']} | Description: {a['key_action']} | Amount: ${a['dollar_amount']:,} | URL: {a.get('source_url') or 'https://municipal-intent-search'}\n"
+            
+        for b in matches.get("budget", []):
+            budgets_text += f"- [Budget {b['id']}] Jurisdiction: {b['jurisdiction_name']} | Year: {b['fiscal_year']} | Revenue: ${b['total_revenue']:,} | Expenditures: ${b['total_expenditures']:,} | {b['major_category']}: ${b['item_amount']:,} | URL: {b.get('source_url') or 'https://portal.sao.wa.gov/ReportSearch'}\n"
+            
+        grant_matches = [g for g in matches.get("grant", []) if str(g["id"]) != pivot_id]
+        for g in grant_matches:
+            grants_text += f"- [Grant {g['id']}] Recipient: {g['recipient_jurisdiction']} | Title: {g['grant_title']} | Amount: ${g['award_amount']:,} | Date: {g['award_date']} | Agency: {g['awarding_agency']} | Purpose: {g['purpose_category']} | URL: {g.get('source_url') or 'https://www.usaspending.gov'}\n"
+            
+        for s in matches.get("school", []):
+            schools_text += f"- [School {s['id']}] District: {s['district_name']} | Year: {s['fiscal_year']} | Enrollment: {s['enrollment']:.0f} FTE | Rev: ${s['total_revenue']:,} | Exp: ${s['total_expenditures']:,} | Levy: ${s['levy_amount']:,} | SpEd Exp: ${s['special_education_spending']:,} | URL: {s.get('source_url') or 'https://data.wa.gov'}\n"
 
-    budgets_text = ""
-    for b in budgets[:15]:
-        item_str = f" | {b['major_category']}: ${b['item_amount']:,}" if b.get("major_category") else ""
-        budgets_text += f"- [Budget {b['id']}] Jurisdiction: {b['jurisdiction_name']} | Year: {b['fiscal_year']} | Revenue: ${b['total_revenue']:,} | Expenditures: ${b['total_expenditures']:,}{item_str} | URL: {b.get('source_url') or 'https://portal.sao.wa.gov/ReportSearch'}\n"
+        # Check total number of semantic matches
+        total_semantic_matches = len(audit_matches) + len(council_matches) + len(matches.get("budget", [])) + len(grant_matches) + len(matches.get("school", []))
+        if total_semantic_matches == 0:
+            print("    No semantic matches found for this pivot. Skipping.")
+            continue
 
-    grants_text = ""
-    for g in grants[:15]:
-        date_str = str(g.get("award_date") or "")
-        grants_text += f"- [Grant {g['id']}] Recipient: {g['recipient_jurisdiction']} | Title: {g['grant_title']} | Amount: ${g['award_amount']:,} | Date: {date_str} | Agency: {g['awarding_agency']} | Purpose: {g['purpose_category']} | URL: {g.get('source_url') or 'https://www.usaspending.gov'}\n"
+        # 3. Fetch contributions and legislative bills
+        if use_postgres:
+            contributions = fetch_contributions_for_jurisdiction(pivot["jurisdiction"], conn)
+            bills = fetch_relevant_bills(pivot["text"], conn)
+        else:
+            contributions = fetch_contributions_for_jurisdiction_sqlite(pivot["jurisdiction"])
+            bills = fetch_relevant_bills_sqlite(pivot["text"])
 
-    schools_text = ""
-    for s in school_financials[:15]:
-        schools_text += f"- [School {s['id']}] District: {s['district_name']} | Year: {s['fiscal_year']} | Enrollment: {s['enrollment']:.0f} FTE | Rev: ${s['total_revenue']:,} | Exp: ${s['total_expenditures']:,} | Levy: ${s['levy_amount']:,} | SpEd Exp: ${s['special_education_spending']:,} | URL: {s.get('source_url') or 'https://data.wa.gov'}\n"
+        contributions_text = ""
+        for c in contributions:
+            contributions_text += f"- [Contribution {c['id']}] Candidate: {c['candidate_name']} | Contributor: {c['contributor_name']} ({c['contributor_employer'] or 'No Employer info'}) | Amount: ${c['amount']:,} | Date: {c['receipt_date']} | Jurisdiction: {c['jurisdiction'] or 'Statewide/Unknown'} | URL: {c.get('source_url') or 'https://www.pdc.wa.gov'}\n"
+            
+        bills_text = ""
+        for b in bills:
+            passed_str = f" | Passed: {b['passed_date']}" if b.get("passed_date") else ""
+            summary_str = f" | Summary: {b['summary']}" if b.get("summary") else ""
+            bills_text += f"- [Bill {b['bill_number']}] Title: {b['title']} | Biennium: {b['biennium']} | Sponsor: {b['sponsor'] or 'Unknown'} | Category: {b['policy_category'] or 'General'}{passed_str}{summary_str} | URL: https://app.leg.wa.gov/billsummary?BillNumber={b['bill_number']}\n"
 
-    contributions_text = ""
-    for c in contributions[:15]:
-        date_str = str(c.get("receipt_date") or "")
-        contributions_text += f"- [Contribution {c['id']}] Candidate: {c['candidate_name']} | Contributor: {c['contributor_name']} ({c['contributor_employer'] or 'No Employer info'}) | Amount: ${c['amount']:,} | Date: {date_str} | Jurisdiction: {c['jurisdiction'] or 'Statewide/Unknown'} | URL: {c.get('source_url') or 'https://www.pdc.wa.gov'}\n"
+        # Format target pivot info
+        pivot_text = f"--- TARGET PIVOT RECORD ({pivot_type.upper()}) ---\n"
+        if pivot_type == "audit":
+            pivot_text += f"- [Audit {pivot_id}] Jurisdiction: {pivot['jurisdiction']} | Year: {pivot.get('year', '2025')} | Summary: {pivot['text']}\n"
+        elif pivot_type == "council":
+            pivot_text += f"- [Event {pivot_id}] Jurisdiction: {pivot['jurisdiction']} | Action: {pivot['text']}\n"
+        elif pivot_type == "grant":
+            pivot_text += f"- [Grant {pivot_id}] Recipient: {pivot['jurisdiction']} | Title: {pivot['text']}\n"
 
-    bills_text = ""
-    for b in bills[:15]:
-        passed_str = f" | Passed: {b['passed_date']}" if b.get("passed_date") else ""
-        summary_str = f" | Summary: {b['summary']}" if b.get("summary") else ""
-        bills_text += f"- [Bill {b['bill_number']}] Title: {b['title']} | Biennium: {b['biennium']} | Sponsor: {b['sponsor'] or 'Unknown'} | Category: {b['policy_category'] or 'General'}{passed_str}{summary_str} | URL: https://app.leg.wa.gov/billsummary?BillNumber={b['bill_number']}\n"
+        # 4. Draft correlation report (Writer Agent)
+        writer_system_prompt = """You are an expert investigative civic analyst specializing in tracking public finance, political accountability, and downstream policy outcomes in Washington State.
+Your objective is to conduct deep, rigorous civic investigations and highlight analytical correlations.
+Specifically, prioritize tracing sequences of influence, policy, and subsequent results: e.g. Influence (campaign contributions) -> Law/Policy (council action/legislative bill) -> Downstream Outcome (audit finding/expenditures).
 
-    system_prompt = """You are an expert investigative civic analyst specializing in tracking public finance, political accountability, and downstream policy outcomes in Washington State. Your objective is to conduct deep, rigorous civic investigations and highlight analytical correlations rather than commercial or journalistic news summaries.
-Analyze the provided audit findings, local city council actions, municipal budgets, state/federal grants, school district financials, campaign contributions, and legislative bills. Find underlying connections, policy effects, or cooperative initiatives.
+CRITICAL REQUIREMENT: 
+You MUST ONLY reference and cite the specific records provided in the inputs below. 
+Do NOT invent, assume, or hallucinate any other audits, council meetings, grants, budgets, campaign contributions, or legislative bills. 
+If a section of inputs is empty or says "None", you must NOT refer to or cite any records of that type. 
+Every citation ID in your output's "citations" list MUST exactly match one of the IDs provided in the brackets (e.g. `1034964`, `evt_orting_102`, etc.) in the inputs. 
+Never make up your own citation IDs.
 
-CRITICAL - CAUSALITY & INVESTIGATIVE CONNECTIONS (MONEY ➔ POLICY ➔ OUTCOME):
-- Uncover unexpected, interesting, or damaging correlations, as well as notable policy successes, project completions, or other known concrete outcomes.
-- Specifically, prioritize tracing sequences of influence, policy, and subsequent results: Campaign contributions or lobbying dollars ($) from special interests, developers, or unions ➔ specific state legislative bills or municipal policies passed ➔ downstream local outcomes (which can include local administrative failures/deficits/bad audit findings, OR conversely, positive civic successes, new infrastructure contracts, or other known project/grant outcomes). (i.e. Influence ➔ Law/Policy ➔ Downstream Outcome/Result).
-- Connect the dots clearly, showing how financial or political inputs correlate with subsequent local outcomes and administrative results.
+Every key fact, budget figure, or audit finding MUST be directly cited inline using standard markdown links with a descriptive anchor text (e.g. `[Aberdeen Audit (2024)](url)`).
+All URLs MUST exactly match the URLs provided in the database inputs.
 
-CRITICAL - TEMPORAL SEQUENCING & CHRONOLOGICAL FLOW:
-- Temporal order is just as important as matching entries. You MUST establish a logical timeline showing that events occurred sequentially.
-- The narrative must explicitly trace this chronology.
-- IMPORTANT - CHRONOLOGICAL INTEGRITY: A past event cannot be a "downstream result" or effect of a future event. For example, a compliance failure from a 2024 audit CANNOT be caused by, strain from, or related to a 2026 grant. Events can only influence or lead to subsequent events in the future. Always check the year/date of each record.
-- Refer to the year of the data (e.g., 2024 fiscal year or 2025 budget year) in the narrative text. Do not claim that the events occurred in the publication year of the audit report (e.g. 2026) if the database entry indicates the data year is different (e.g. 2024).
-- Do not treat correlations as static or simultaneous co-occurrences. Clearly walk the reader through the chronological progression.
-
-CRITICAL - PROGRAM BOUNDARIES & CAUSATION:
-- Do not fabricate or extrapolate causal links between unrelated programs or events. For example, do not claim that an audit finding regarding a procurement oversight on a Highway project was a result of or strain from a FEMA SAFER fire grant.
-- If two events occur in the same jurisdiction but cover completely different areas (e.g. transport procurement and fire department staffing), you must treat them as parallel examples illustrating the overall scale of federal funding versus administrative capacity, rather than claiming one caused the other.
-- Be precise when grouping entities. Do not apply a specific detail (like a dollar threshold, e.g. $25,000, or a specific program name) to multiple entities if that detail is only associated with one of them in the database inputs.
-
-CRITICAL - ANALYTICAL TONE & LEGISLATIVE FACTUALITY:
-- State legislative bills and policy changes are rarely passed by unanimous consent. However, you MUST NOT fabricate or include specific debates, floor arguments, opponent/proponent statements, or quotes unless they are explicitly present in the provided source text database. Do NOT use phrases like "proponents argued" or "opponents cautioned" to describe general policy tradeoffs; if the database summary does not list specific arguments, simply state what the bill does without attributing arguments or mentioning proponents or opponents.
-- If the database only contains the bill number, summary, sponsors, and passed date, stick strictly to what the bill actually does. Do not invent quotes or floor statements. Do not include any hypothetical or general arguments/debates.
-- Avoid commercial, sensationalist, or promotional news-reporting language. Do NOT use phrases like "state leaders hope", "lawmakers agree", or describing a bill as a simple "solution" without acknowledging its contested nature.
-- Maintain a strictly analytical, objective, and investigative tone. Present the policy change as a debated mechanism with tradeoffs rather than an unalloyed positive development.
-- EVERY claim in the report must be directly supported by the database inputs provided. Do not make ungrounded assumptions (e.g., claiming "no funds were lost" if the audit doesn't explicitly state that).
-- Do not use words like 'influx', 'surge', 'crisis', or 'systemic failure' in the title or hook unless the database records for each cited entity explicitly support a significant increase, deficit, or systemic finding.
-- If citing multiple audits or records for a single city or school district, refer to them as separate records or reports (using their specific IDs or report numbers); do not refer to them as 'the same audit/record' unless they share the same ID.
-
-CRITICAL: All content must be written in plain, accessible language that is easy for the general public to understand (target an 8th-to-9th-grade reading level), while maintaining strict factual accuracy.
-Avoid dense academic jargon and overly complex phrasing. For example:
-- Instead of "systemic administrative collapse", use "severe staffing shortages and record-keeping delays".
-- Instead of "inter-departmental data fragmentation hampers permitting", use "departments using software that doesn't share information, which slows down building permits".
-- Keep explanations direct, active, and engaging for everyday citizens.
-
-Identify 2 distinct correlations. For each, generate:
-1. Title: A clear, analytical title that exposes the connection found (avoid clickbaity, commercial, or sensationalist news-headline phrasing).
-2. Hook: A 1-2 sentence compelling teaser summarizing the core analytical connection.
-3. Report: A markdown report (300-400 words) presenting the investigative analysis, tracing the temporal chain of events, explaining why it matters to local residents, and highlighting the downstream impacts.
-   CRITICAL: The report MUST be written as an analytical investigation, leaning heavily toward citation of verifiable sources.
-   CRITICAL: Every key fact, budget figure, audit finding, campaign contribution, or legislative statement in the report MUST be directly cited inline using standard markdown link syntax with a descriptive anchor text (e.g., `[Aberdeen School District Financial Report (2024)](url)` or `[Bill SSB 5412 (2025-26)](url)` or `[Contribution to Candidate X (2024)](url)`).
-   The URL in these inline markdown links MUST exactly match the corresponding source URL defined in the `citations` list and the URL provided on the input line for that cited item.
-   CRITICAL: You MUST explicitly include the audit/fiscal year or event date (e.g. 2024 or 2025) in the narrative text when describing the data.
-4. Citations: List the specific items cited.
-   CRITICAL: You MUST explicitly include the year in the citation title.
-   Support citations of source types: 'audit', 'council', 'budget', 'grant', 'school', 'contribution', or 'bill'.
-
-Format your output STRICTLY as a JSON object matching this schema:
+Format your output strictly as a JSON object matching this schema:
 {
-  "correlations": [
+  "title": "Analytical connection title",
+  "hook": "Teaser string",
+  "report_markdown": "Full analysis report in Markdown format",
+  "citations": [
     {
-      "title": "Analytical connection title",
-      "hook": "Teaser string",
-      "report_markdown": "Full analysis report in Markdown format",
-      "citations": [
-        {
-          "id": "The report_num, event_id, grant_id, contribution_id, bill_number, or budget/school year cited",
-          "source": "audit" | "council" | "budget" | "grant" | "school" | "contribution" | "bill",
-          "title": "Readable title for the citation containing the year, e.g. Orting Budget (2025) or Bill HB 1003 (2025)",
-          "url": "Provide a valid URL (MUST exactly match the URL provided in the input list for this item; do not invent or use placeholder URLs)"
-        }
-      ]
+      "id": "The cited ID",
+      "source": "audit" | "council" | "budget" | "grant" | "school" | "contribution" | "bill",
+      "title": "Citation title including the year",
+      "url": "Provide the exact matching URL from the inputs"
     }
   ]
-Return ONLY the raw JSON object, without markdown block formatting (do not wrap in ```json). Ensure that all double quotes inside the JSON string values are strictly escaped as \" to maintain a valid, parsable JSON structure."""
+}
+Ensure all double quotes inside JSON string values are escaped as \\\"."""
 
+        writer_prompt = f"""Draft a correlation report connecting the following target pivot record with the related semantic and geographical context:
 
-    prompt = f"""Identify 2 correlations based on these lists:
+{pivot_text}
 
---- STATE AUDITOR FINDINGS ---
-{findings_text}
+--- RELATED SEMANTIC AUDIT FINDINGS ---
+{findings_text or "None"}
 
---- MUNICIPAL COUNCIL ACTIONS ---
-{actions_text}
+--- RELATED SEMANTIC COUNCIL ACTIONS ---
+{actions_text or "None"}
 
---- LOCAL GOVERNMENT BUDGETS ---
-{budgets_text}
+--- RELATED SEMANTIC BUDGETS ---
+{budgets_text or "None"}
 
---- STATE & FEDERAL GRANTS ---
-{grants_text}
+--- RELATED SEMANTIC GRANTS ---
+{grants_text or "None"}
 
---- SCHOOL DISTRICT FINANCIALS ---
-{schools_text}
+--- RELATED SEMANTIC SCHOOL DISTRICT FINANCIALS ---
+{schools_text or "None"}
 
---- SIGNIFICANT CAMPAIGN CONTRIBUTIONS ---
-{contributions_text}
+--- GEOGRAPHIC CAMPAIGN CONTRIBUTIONS ---
+{contributions_text or "None"}
 
---- STATE LEGISLATIVE BILLS ---
-{bills_text}"""
-
-    try:
-        membrane = MembraneClient()
-        response = membrane.chat_completion(
-            model="membrane-engagement-layer",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0
-        )
-        
-        if isinstance(response, dict):
-            content = response["choices"][0]["message"]["content"].strip()
-        else:
-            content = response.choices[0].message.content.strip()
-        
-        # Clean potential markdown wrapping
-        if content.startswith("```"):
-            lines = content.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines[-1].startswith("```"):
-                lines = lines[:-1]
-            content = "\n".join(lines).strip()
-            
-        print("DEBUG: Raw response content:", repr(content))
-        data = json.loads(content)
-        
-        # Self-correction loop
-        validated_correlations = []
-        for c in data.get("correlations", []):
-            attempts = 0
-            max_attempts = 2
-            current_corr = c
-            
-            while attempts < max_attempts:
-                # 1. Fetch verbatim contexts for all citations in current_corr
-                citations_with_context = []
-                for cit in current_corr.get("citations", []):
-                    verbatim = get_verbatim_context_for_citation(cit)
-                    citations_with_context.append({
-                        "id": cit.get("id"),
-                        "source": cit.get("source"),
-                        "title": cit.get("title"),
-                        "url": cit.get("url"),
-                        "verbatim_text_context": verbatim
-                    })
+--- RELEVANT LEGISLATIVE BILLS ---
+{bills_text or "None"}
+"""
+        print("    Drafting correlation...")
+        try:
+            response = membrane.chat_completion(
+                model="membrane-engagement-layer",
+                messages=[
+                    {"role": "system", "content": writer_system_prompt},
+                    {"role": "user", "content": writer_prompt}
+                ],
+                temperature=0.0
+            )
+            if isinstance(response, dict):
+                content = response["choices"][0]["message"]["content"].strip()
+            else:
+                content = response.choices[0].message.content.strip()
                 
-                # 2. Run fact checker prompt
-                fact_check_prompt = f"""You are a strict, objective fact checker. Review the following correlation report draft against the verbatim contexts of its citations.
+            if content.startswith("```"):
+                lines = content.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                content = "\n".join(lines).strip()
                 
+            current_corr = json.loads(content)
+            # Auto-normalize domain typos in report_markdown and citations
+            if "report_markdown" in current_corr and isinstance(current_corr["report_markdown"], str):
+                current_corr["report_markdown"] = current_corr["report_markdown"].replace("sao.wa.wa.gov", "sao.wa.gov")
+            if "citations" in current_corr and isinstance(current_corr["citations"], list):
+                for cit in current_corr["citations"]:
+                    if "url" in cit and isinstance(cit["url"], str):
+                        cit["url"] = cit["url"].replace("sao.wa.wa.gov", "sao.wa.gov")
+        except Exception as e:
+            print("    Error drafting correlation:", e)
+            continue
+
+        # 5. Skeptical Critic & Relevance Evaluator Loop
+        critic_system_prompt = """You are a highly skeptical senior investigative editor reviewing civic governance correlations for PennerAI.
+Your role is to act as a healthy skeptic, evaluating if the proposed correlation is genuinely meaningful, logically sound, and non-trivial, or if it is just a forced, coincidental alignment.
+
+Evaluate the draft on the following:
+1. RELEVANCE & CIVIC INTEREST (Score 1.0 to 10.0): Is the connection interesting, non-obvious, and highly relevant? (e.g. connecting campaign donations to vendor contract wins, or a specific policy change to a subsequent audit finding). If it just states the obvious or links trivial things (e.g., "Seattle Police spent money on policing and had a standard police audit"), score it < 7.0 and REJECT it.
+2. SPURIOUS LINKS: Did the writer invent or imply a false causal connection between unrelated programs just because they are in the same city? (e.g. claiming a housing grant caused an audit issue in the fire department). If so, score it < 7.0 and REJECT.
+3. CHRONOLOGICAL SANITY: Does the timeline make sense? (A cause must precede an effect chronologically).
+
+Return your response strictly as a JSON object:
+{
+  "status": "APPROVED" | "REJECTED" | "REQUIRES_REWRITE",
+  "score": 1.0 to 10.0,
+  "criticism": "Detailed explanation of your reasoning. Highlight any forced causality or triviality."
+}
+Ensure all double quotes inside JSON string values are escaped as \\\"."""
+
+        print(f"    Skeptical Critic evaluating correlation: '{current_corr.get('title')}'...")
+        try:
+            critic_response = membrane.chat_completion(
+                model="membrane-engagement-layer",
+                messages=[
+                    {"role": "system", "content": critic_system_prompt},
+                    {"role": "user", "content": json.dumps(current_corr)}
+                ],
+                temperature=0.0
+            )
+            if isinstance(critic_response, dict):
+                critic_content = critic_response["choices"][0]["message"]["content"].strip()
+            else:
+                critic_content = critic_response.choices[0].message.content.strip()
+                
+            if critic_content.startswith("```"):
+                lines = critic_content.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                critic_content = "\n".join(lines).strip()
+                
+            critic_data = json.loads(critic_content)
+            print(f"      Critic Score: {critic_data.get('score')} | Status: {critic_data.get('status')}")
+            
+            if critic_data.get("status") == "REJECTED" or float(critic_data.get("score", 0)) < 7.0:
+                print(f"      ❌ Rejected by Critic: {critic_data.get('criticism')}")
+                continue
+            elif critic_data.get("status") == "REQUIRES_REWRITE":
+                print(f"      ⚠️ Rewrite required: {critic_data.get('criticism')}. Requesting correction...")
+                # Request rewrite from Writer with critic's feedback
+                rewrite_prompt = f"""You are the correlation generator. The proposed correlation requires a rewrite based on the senior editor's critique.
+                
+Proposed Correlation:
+{json.dumps(current_corr, indent=2)}
+
+Editor Critique:
+{critic_data.get('criticism')}
+
+Rewrite the correlation to resolve the issues. Return the rewritten correlation strictly as a JSON object with keys 'title', 'hook', 'report_markdown', 'citations'."""
+                rewrite_response = membrane.chat_completion(
+                    model="membrane-engagement-layer",
+                    messages=[
+                        {"role": "system", "content": writer_system_prompt},
+                        {"role": "user", "content": rewrite_prompt}
+                    ],
+                    temperature=0.0
+                )
+                if isinstance(rewrite_response, dict):
+                    rewrite_content = rewrite_response["choices"][0]["message"]["content"].strip()
+                else:
+                    rewrite_content = rewrite_response.choices[0].message.content.strip()
+                if rewrite_content.startswith("```"):
+                    lines = rewrite_content.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    rewrite_content = "\n".join(lines).strip()
+                current_corr = json.loads(rewrite_content)
+        except Exception as e:
+            print("    Error during critic evaluation/rewrite:", e)
+            continue
+
+        # 6. Fact-Checking and Verification Loop
+        attempts = 0
+        max_attempts = 2
+        fact_check_passed = False
+        
+        while attempts < max_attempts:
+            citations_with_context = []
+            for cit in current_corr.get("citations", []):
+                verbatim = get_verbatim_context_for_citation(cit)
+                citations_with_context.append({
+                    "id": cit.get("id"),
+                    "source": cit.get("source"),
+                    "title": cit.get("title"),
+                    "url": cit.get("url"),
+                    "verbatim_text_context": verbatim
+                })
+            
+            from datetime import datetime
+            current_date_str = datetime.now().strftime("%B %d, %Y")
+            fact_check_prompt = f"""You are a strict, objective fact checker. Review the following correlation report draft against the verbatim contexts of its citations.
+            
 Proposed Correlation:
 Headline Title: {current_corr.get('title')}
 Teaser Hook: {current_corr.get('hook')}
@@ -1063,13 +1849,14 @@ Citations & Verbatim Contexts:
 
 Guidelines:
 1. Ensure every metric, date, dollar amount, and factual claim is 100% supported by the verbatim contexts.
-2. Ensure there are no temporal contradictions (e.g. causes must precede effects; check the audit/data years vs grant dates).
-3. Ensure there are no fabricated details (e.g. district numbers like No 5, or proponent/opponent debates) that are not explicitly present in the verbatim contexts.
-4. Ensure all URLs in markdown links exactly match the citation URLs, and there are no placeholder URLs like '...ReportNumber=NUM'.
-5. If there are ANY discrepancies, contradictions, or unsupported claims, output a list of issues.
-6. If the report is 100% factually accurate, chronologically correct, and URLs match perfectly, output ONLY the word 'PASS' (no markdown, no quotes, no extra text).
+2. Ensure there are no temporal contradictions. Note that today's date is {current_date_str}. Therefore, audits, council meetings, or grants from 2024, 2025, or 2026 (up to {current_date_str}) are in the PAST/PRESENT, not the future. Do NOT flag them as temporal contradictions or future events.
+3. Ensure there are no fabricated details.
+4. Ensure all URLs in markdown links exactly match the citation URLs.
+5. If there are ANY discrepancies, output a list of issues.
+6. If the report is 100% factually accurate, chronologically correct, and URLs match perfectly, output ONLY the word 'PASS'.
 """
-                print(f"Fact-checking generated correlation: '{current_corr.get('title')}' (Attempt {attempts + 1})...")
+            print(f"    Fact-checking (Attempt {attempts + 1})...")
+            try:
                 check_response = membrane.chat_completion(
                     model="membrane-engagement-layer",
                     messages=[
@@ -1078,63 +1865,44 @@ Guidelines:
                     ],
                     temperature=0.0
                 )
-                
                 if isinstance(check_response, dict):
                     check_text = check_response["choices"][0]["message"]["content"].strip()
                 else:
                     check_text = check_response.choices[0].message.content.strip()
                 
                 if check_text == "PASS" or "PASS" in check_text.splitlines():
-                    print("✅ Correlation passed fact-check!")
+                    print("    ✅ Correlation passed fact-check!")
+                    fact_check_passed = True
                     validated_correlations.append(current_corr)
                     break
                 else:
-                    print(f"❌ Correlation failed fact-check. Issues identified:\n{check_text}")
+                    print(f"    ❌ Failed fact-check: {check_text}")
                     attempts += 1
                     if attempts >= max_attempts:
-                        print("⚠️ Maximum correction attempts reached. Saving correlation despite warnings.")
-                        validated_correlations.append(current_corr)
                         break
                         
-                    # Request rewrite / correction
-                    correction_prompt = f"""You are the correlation generator. The proposed correlation failed a strict fact-check review.
+                    # Request rewrite for factual correction
+                    correction_prompt = f"""You are the correlation generator. The proposed correlation failed a fact-check review.
                     
 Proposed Correlation:
-Title: {current_corr.get('title')}
-Hook: {current_corr.get('hook')}
-Report Markdown:
-{current_corr.get('report_markdown')}
+{json.dumps(current_corr, indent=2)}
 
-Verbatim Contexts for Citations:
-{json.dumps(citations_with_context, indent=2)}
-
-Reviewer Feedback:
+Feedback:
 {check_text}
 
-Rewrite the correlation to completely resolve all issues in the feedback.
-Follow all original constraints:
-- Stick strictly to the verbatim contexts.
-- Correct any date or year references (do not call a 2024 audit a 2026 audit, etc.).
-- Remove any fabricated details (e.g. do not invent district numbers or debate details if not in context).
-- Ensure URLs in report markdown exactly match the citation URLs.
-- Make the narrative understandable and easy to read.
-
-Return the rewritten correlation strictly as a JSON object with keys 'title', 'hook', 'report_markdown', 'citations'. Do not wrap in markdown block formatting."""
-                    
+Rewrite the correlation to correct all issues. Return the rewritten correlation strictly as a JSON object."""
                     rewrite_response = membrane.chat_completion(
                         model="membrane-engagement-layer",
                         messages=[
-                            {"role": "system", "content": "You are a helpful assistant."},
+                            {"role": "system", "content": writer_system_prompt},
                             {"role": "user", "content": correction_prompt}
                         ],
                         temperature=0.0
                     )
-                    
                     if isinstance(rewrite_response, dict):
                         rewrite_content = rewrite_response["choices"][0]["message"]["content"].strip()
                     else:
                         rewrite_content = rewrite_response.choices[0].message.content.strip()
-                        
                     if rewrite_content.startswith("```"):
                         lines = rewrite_content.split("\n")
                         if lines[0].startswith("```"):
@@ -1142,33 +1910,32 @@ Return the rewritten correlation strictly as a JSON object with keys 'title', 'h
                         if lines[-1].startswith("```"):
                             lines = lines[:-1]
                         rewrite_content = "\n".join(lines).strip()
-                        
-                    try:
-                        current_corr = json.loads(rewrite_content)
-                    except Exception as parse_err:
-                        print("Failed to parse rewritten correlation JSON:", parse_err)
-                        validated_correlations.append(current_corr)
-                        break
+                    current_corr = json.loads(rewrite_content)
+                    # Auto-normalize domain typos in report_markdown and citations
+                    if "report_markdown" in current_corr and isinstance(current_corr["report_markdown"], str):
+                        current_corr["report_markdown"] = current_corr["report_markdown"].replace("sao.wa.wa.gov", "sao.wa.gov")
+                    if "citations" in current_corr and isinstance(current_corr["citations"], list):
+                        for cit in current_corr["citations"]:
+                            if "url" in cit and isinstance(cit["url"], str):
+                                cit["url"] = cit["url"].replace("sao.wa.wa.gov", "sao.wa.gov")
+            except Exception as e:
+                print("    Error during fact-checking:", e)
+                break
+                
+        if fact_check_passed:
+            generated_count += 1
+
+    # 7. Save Approved Correlations
+    ids = []
+    for c in validated_correlations:
+        print(f"💾 Saving approved correlation: '{c.get('title')}'")
+        row_id = save_correlation(c)
+        ids.append(row_id)
         
-        ids = []
-        for c in validated_correlations:
-            print(f"DEBUG: Saving correlation: '{c.get('title')}'")
-            row_id = save_correlation(c)
-            print(f"DEBUG: Saved correlation. Result row_id: {row_id}")
-            ids.append(row_id)
-            
-        print(f"🤖 Successfully generated and saved {len(ids)} correlations.")
-        return {"status": "success", "source": "membrane-engagement-layer", "generated_ids": ids}
-        
-    except Exception as e:
-        print("Error during AI correlation generation:", e)
-        # Fallback in case of api error
-        fallbacks = get_fallback_correlations()
-        ids = []
-        for f in fallbacks:
-            row_id = save_correlation(f)
-            ids.append(row_id)
-        return {"status": "success", "source": "error_fallbacks", "generated_ids": ids}
+    print(f"🤖 Successfully generated and saved {len(ids)} intelligent correlations.")
+    if conn:
+        conn.close()
+    return {"status": "success", "source": "upgraded-intelligent-semantic-builder", "generated_ids": ids}
 
 if __name__ == "__main__":
     generate_correlations()

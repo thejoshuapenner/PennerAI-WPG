@@ -27,7 +27,8 @@ import {
   Video,
   MessageSquare,
   Sparkles,
-  Send
+  Send,
+  Trash2
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -321,6 +322,13 @@ export default function CuratePage() {
   const [editTitle, setEditTitle] = useState<string>('');
   const [editHook, setEditHook] = useState<string>('');
   const [editMarkdown, setEditMarkdown] = useState<string>('');
+  const [editCitations, setEditCitations] = useState<Citation[]>([]);
+  const [showAddCitationForm, setShowAddCitationForm] = useState<boolean>(false);
+  const [newCitId, setNewCitId] = useState<string>('');
+  const [newCitSource, setNewCitSource] = useState<Citation['source']>('audit');
+  const [newCitTitle, setNewCitTitle] = useState<string>('');
+  const [newCitUrl, setNewCitUrl] = useState<string>('');
+  const [newCitVerbatim, setNewCitVerbatim] = useState<string>('');
 
   // Correlation Chat state
   const [corrChatInput, setCorrChatInput] = useState<string>('');
@@ -394,6 +402,7 @@ export default function CuratePage() {
     setEditTitle(c.title);
     setEditHook(c.hook);
     setEditMarkdown(c.report_markdown);
+    setEditCitations(c.citations || []);
     setIsEditing(false);
     setCorrChatMessages([]);
     setCorrChatInput('');
@@ -419,7 +428,7 @@ export default function CuratePage() {
         title: isEditing ? editTitle : activeCorr.title,
         hook: isEditing ? editHook : activeCorr.hook,
         report_markdown: isEditing ? editMarkdown : activeCorr.report_markdown,
-        citations: activeCorr.citations,
+        citations: isEditing ? editCitations : activeCorr.citations,
         message: textToSend,
         history: corrChatMessages // Send current history
       };
@@ -899,7 +908,8 @@ export default function CuratePage() {
         body: JSON.stringify({
           title: editTitle,
           hook: editHook,
-          report_markdown: editMarkdown
+          report_markdown: editMarkdown,
+          citations: editCitations
         })
       });
       if (res.ok) {
@@ -907,7 +917,8 @@ export default function CuratePage() {
           ...c, 
           title: editTitle, 
           hook: editHook, 
-          report_markdown: editMarkdown 
+          report_markdown: editMarkdown,
+          citations: editCitations
         } : c));
         setIsEditing(false);
       }
@@ -916,6 +927,75 @@ export default function CuratePage() {
     } finally {
       setActionLoading(null);
     }
+  };
+
+  const handleAddCitationFromRow = (row: any) => {
+    if (!selectedSourceId) return;
+    
+    let source: Citation['source'] = 'audit';
+    let id = '';
+    let title = 'New Citation';
+    let url = row.source_url || '';
+    let verbatim = row.verbatim_text_context || '';
+    
+    if (selectedSourceId === 'findings') {
+      source = 'audit';
+      id = String(row.report_num || '');
+      title = `${row.jurisdiction || 'Unknown'} Audit ${row.year ? '(' + row.year + ')' : ''}`;
+      if (!url) {
+        url = `https://portal.sao.wa.gov/ReportSearch/Home/ViewReportFile?ReportNumber=${id}`;
+      }
+    } else if (selectedSourceId === 'processed_intent') {
+      source = 'council';
+      id = String(row.event_id || row.id || '');
+      title = `${row.jurisdiction || 'Unknown'} Council Action (${row.meeting_date || ''})`;
+      verbatim = row.verbatim_text_context || row.key_action || '';
+    } else if (selectedSourceId === 'budgets') {
+      source = 'budget';
+      id = String(row.id || '');
+      title = `${row.jurisdiction_name || 'Unknown'} Budget ${row.fiscal_year ? '(' + row.fiscal_year + ')' : ''}`;
+      verbatim = `Budget Record for ${row.jurisdiction_name} (${row.fiscal_year}): Total Revenue: $${row.total_revenue?.toLocaleString() || '0'}, Total Expenditures: $${row.total_expenditures?.toLocaleString() || '0'}`;
+    } else if (selectedSourceId === 'grants') {
+      source = 'grant';
+      id = String(row.id || '');
+      title = `${row.grant_title || 'Grant'} to ${row.recipient_jurisdiction || 'Unknown'} (${row.award_date || ''})`;
+      verbatim = `Grant Award: '${row.grant_title}' awarded to ${row.recipient_jurisdiction} by ${row.awarding_agency || 'Unknown'}. Amount: $${row.award_amount?.toLocaleString() || '0'}`;
+    } else if (selectedSourceId === 'school_district_financials') {
+      source = 'school';
+      id = String(row.id || '');
+      title = `${row.district_name || 'Unknown'} School District ${row.fiscal_year ? '(' + row.fiscal_year + ')' : ''}`;
+      verbatim = `School District Financials: ${row.district_name} (${row.fiscal_year}). Revenue: $${row.total_revenue?.toLocaleString() || '0'}, Expenditures: $${row.total_expenditures?.toLocaleString() || '0'}`;
+    } else if (selectedSourceId === 'political_contributions') {
+      source = 'contribution';
+      id = String(row.id || '');
+      title = `Contribution to ${row.candidate_name || 'Candidate'} by ${row.contributor_name || 'Contributor'} ($${row.amount?.toLocaleString() || '0'})`;
+      verbatim = `Campaign Contribution: ${row.contributor_name} donated $${row.amount?.toLocaleString() || '0'} to ${row.candidate_name} (${row.jurisdiction || 'Statewide'}) on ${row.receipt_date || ''}.`;
+    } else if (selectedSourceId === 'legislative_bills') {
+      source = 'bill';
+      id = String(row.bill_number || '');
+      title = `Bill ${row.bill_number}: ${row.title || 'Untitled'}`;
+      verbatim = `Legislative Bill ${row.bill_number}: ${row.title}. Summary: ${row.summary || ''}`;
+      url = `https://app.leg.wa.gov/billsummary?BillNumber=${id}`;
+    }
+    
+    const newCit: Citation = {
+      id,
+      source,
+      title,
+      url,
+      verbatim_text_context: verbatim,
+      verification_score: 1.0,
+      meeting_type: 'Manual'
+    };
+    
+    setEditCitations(prev => {
+      const exists = prev.some(c => c.id === newCit.id && c.source === newCit.source);
+      if (exists) return prev;
+      return [...prev, newCit];
+    });
+    
+    alert(`Added "${title}" as a citation to your draft!`);
+    setSelectedRowDetails(null);
   };
 
   const handleTriggerGenerate = async () => {
@@ -1462,12 +1542,134 @@ export default function CuratePage() {
 
                   {/* Citations Reference Drawer */}
                   <div className="bg-white border border-slate-200/80 rounded-3xl p-6 shadow-sm space-y-4">
-                    <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider pl-0.5">
-                      Identified Citations & Verbatim Context Audit ({activeCorr.citations.length})
-                    </h3>
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider pl-0.5">
+                        Identified Citations & Verbatim Context Audit ({(isEditing ? editCitations : activeCorr.citations).length})
+                      </h3>
+                      {isEditing && (
+                        <button
+                          onClick={() => setShowAddCitationForm(!showAddCitationForm)}
+                          className="px-3 py-1.5 text-2xs font-bold text-evergreen border border-evergreen/30 bg-evergreen/5 rounded-xl hover:bg-evergreen hover:text-white transition-colors cursor-pointer"
+                        >
+                          {showAddCitationForm ? 'Hide Add Form' : '+ Add Citation'}
+                        </button>
+                      )}
+                    </div>
+
+                    {isEditing && showAddCitationForm && (
+                      <div className="p-5 border border-slate-200 rounded-2xl bg-slate-50/50 space-y-4">
+                        <h4 className="text-xs font-black text-slate-700 uppercase tracking-wider pl-0.5">
+                          Add New Citation
+                        </h4>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="space-y-1">
+                            <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider pl-0.5">Source Type</label>
+                            <select
+                              value={newCitSource}
+                              onChange={(e) => setNewCitSource(e.target.value as Citation['source'])}
+                              className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-evergreen focus:border-evergreen"
+                            >
+                              <option value="audit">Audit</option>
+                              <option value="council">Council Action</option>
+                              <option value="budget">Budget</option>
+                              <option value="grant">Grant</option>
+                              <option value="school">School District</option>
+                              <option value="contribution">Campaign Contribution</option>
+                              <option value="bill">Legislative Bill</option>
+                              <option value="other">Other</option>
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider pl-0.5">Reference ID (e.g. Audit Num)</label>
+                            <input
+                              type="text"
+                              placeholder="e.g. 1038179"
+                              value={newCitId}
+                              onChange={(e) => setNewCitId(e.target.value)}
+                              className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-evergreen focus:border-evergreen"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider pl-0.5">Citation Title</label>
+                          <input
+                            type="text"
+                            placeholder="e.g. City of Seattle Audit (2025)"
+                            value={newCitTitle}
+                            onChange={(e) => setNewCitTitle(e.target.value)}
+                            className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-evergreen focus:border-evergreen"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider pl-0.5">Source URL</label>
+                          <input
+                            type="text"
+                            placeholder="e.g. https://portal.sao.wa.gov/..."
+                            value={newCitUrl}
+                            onChange={(e) => setNewCitUrl(e.target.value)}
+                            className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-evergreen focus:border-evergreen"
+                          />
+                        </div>
+
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider pl-0.5">Verbatim Context / Snippet</label>
+                          <textarea
+                            placeholder="Paste the exact text context from the source documents..."
+                            value={newCitVerbatim}
+                            onChange={(e) => setNewCitVerbatim(e.target.value)}
+                            rows={3}
+                            className="w-full text-xs px-3 py-2 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-1 focus:ring-evergreen focus:border-evergreen resize-none"
+                          />
+                        </div>
+
+                        <div className="flex justify-end gap-2 pt-1">
+                          <button
+                            onClick={() => {
+                              setShowAddCitationForm(false);
+                              setNewCitId('');
+                              setNewCitTitle('');
+                              setNewCitUrl('');
+                              setNewCitVerbatim('');
+                            }}
+                            className="px-3 py-2 text-xs font-bold text-slate-500 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (!newCitTitle.trim()) {
+                                alert('Please provide a citation title.');
+                                return;
+                              }
+                              const newCit: Citation = {
+                                id: newCitId || 'manual',
+                                source: newCitSource,
+                                title: newCitTitle,
+                                url: newCitUrl,
+                                verbatim_text_context: newCitVerbatim,
+                                verification_score: 1.0,
+                                meeting_type: 'Manual'
+                              };
+                              setEditCitations(prev => [...prev, newCit]);
+                              // Reset
+                              setShowAddCitationForm(false);
+                              setNewCitId('');
+                              setNewCitTitle('');
+                              setNewCitUrl('');
+                              setNewCitVerbatim('');
+                            }}
+                            className="px-4 py-2 text-xs font-bold text-white bg-evergreen hover:bg-evergreen-dark rounded-xl transition-colors cursor-pointer"
+                          >
+                            Add to List
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     
                     <div className="space-y-4.5">
-                      {activeCorr.citations.map((cit, cIdx) => (
+                      {(isEditing ? editCitations : activeCorr.citations).map((cit, cIdx) => (
                         <div 
                           key={cIdx}
                           className="p-5 rounded-2xl bg-slate-50/70 border border-slate-200/60 hover:bg-slate-50 transition-colors group space-y-3"
@@ -1502,16 +1704,29 @@ export default function CuratePage() {
                               </h4>
                             </div>
                             
-                            {cit.url && (
-                              <a 
-                                href={cit.url} 
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                className="w-7 h-7 rounded-lg border border-slate-200 bg-white flex items-center justify-center shrink-0 text-slate-400 group-hover:text-evergreen group-hover:border-evergreen/30 transition-colors cursor-pointer"
-                              >
-                                <ExternalLink className="w-3.5 h-3.5" />
-                              </a>
-                            )}
+                            <div className="flex items-center gap-2 shrink-0">
+                              {cit.url && (
+                                <a 
+                                  href={cit.url} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer"
+                                  className="w-7 h-7 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-slate-400 hover:text-evergreen hover:border-evergreen/30 transition-colors cursor-pointer"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" />
+                                </a>
+                              )}
+                              {isEditing && (
+                                <button
+                                  onClick={() => {
+                                    setEditCitations(prev => prev.filter((_, idx) => idx !== cIdx));
+                                  }}
+                                  className="w-7 h-7 rounded-lg border border-red-200 bg-red-50 flex items-center justify-center text-red-500 hover:bg-red-100 hover:text-red-700 hover:border-red-300 transition-colors cursor-pointer"
+                                  title="Remove Citation"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
                           </div>
 
                           {/* Verbatim Context Snippet Box */}
@@ -2816,7 +3031,17 @@ export default function CuratePage() {
             </div>
 
             {/* Modal Footer */}
-            <div className="p-4 border-t border-slate-100 bg-slate-50/50 flex justify-end shrink-0">
+            <div className="p-4 border-t border-slate-100 bg-slate-50/50 flex justify-between items-center shrink-0">
+              <div>
+                {isEditing && activeCorr && (
+                  <button 
+                    onClick={() => handleAddCitationFromRow(selectedRowDetails)}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm"
+                  >
+                    Add as Citation to Current Draft
+                  </button>
+                )}
+              </div>
               <button 
                 onClick={() => setSelectedRowDetails(null)}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm"

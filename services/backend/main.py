@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import date
 from dotenv import load_dotenv
 
@@ -4566,14 +4566,104 @@ class CorrelationEditRequest(BaseModel):
     title: str
     hook: str
     report_markdown: str
+    citations: Optional[List[Dict[str, Any]]] = None
 
 def enrich_correlations_with_years(correlations_list: list) -> list:
     """Enrich correlation citations with their respective audit years, verbatim audit trails, and source URLs dynamically."""
     import re
     for corr in correlations_list:
-        citations = corr.get("citations", [])
-        if not isinstance(citations, list):
-            continue
+        citations = corr.get("citations")
+        if citations is None:
+            citations = []
+            corr["citations"] = citations
+        elif not isinstance(citations, list):
+            citations = []
+            corr["citations"] = citations
+
+        # Proactively parse missing citations from markdown links
+        markdown = corr.get("report_markdown") or ""
+        did_heal = False
+        if markdown:
+            links = re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', markdown)
+            for text, url in links:
+                url_norm = url.replace("ReportNumber=", "arn=")
+                if "isFinding=" not in url_norm and "arn=" in url_norm:
+                    url_norm += "&isFinding=false&sp=false"
+
+                already_exists = False
+                for cit in citations:
+                    cit_url = cit.get("url") or ""
+                    cit_url_norm = cit_url.replace("ReportNumber=", "arn=")
+                    if "isFinding=" not in cit_url_norm and "arn=" in cit_url_norm:
+                        cit_url_norm += "&isFinding=false&sp=false"
+                    if cit_url_norm == url_norm:
+                        already_exists = True
+                        break
+
+                if not already_exists:
+                    cit_id = None
+                    source = "other"
+                    
+                    match = re.search(r'(?:ReportNumber|arn)=(\d+)', url, re.IGNORECASE)
+                    if match:
+                        cit_id = match.group(1)
+                        source = "audit"
+                    else:
+                        bill_match = re.search(r'BillNumber=([A-Z0-9]+)', url, re.IGNORECASE)
+                        if bill_match:
+                            cit_id = bill_match.group(1)
+                            if not re.search(r'\s', cit_id):
+                                m2 = re.match(r'([A-Za-z]+)(\d+)', cit_id)
+                                if m2:
+                                    cit_id = f"{m2.group(1)} {m2.group(2)}"
+                            source = "bill"
+                        elif "usaspending.gov" in url:
+                            source = "grant"
+                            parts = url.rstrip("/").split("/")
+                            cit_id = parts[-1]
+                        elif "pdc.wa.gov" in url:
+                            source = "contribution"
+                            cit_id = text
+                            
+                    if not cit_id:
+                        cit_id = text
+
+                    citations.append({
+                        "id": cit_id,
+                        "source": source,
+                        "title": text,
+                        "url": url
+                    })
+                    did_heal = True
+
+        if did_heal:
+            # Save healed citations back to DB
+            try:
+                conn = get_pg_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE correlations SET citations = %s WHERE id = %s",
+                    (json.dumps(citations), corr["id"])
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+            except Exception:
+                for db_name in ["sao_audits.db", "sao_2024.db", "municipal_intent.db"]:
+                    conn = get_sqlite_conn(db_name)
+                    if conn:
+                        try:
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE correlations SET citations = ? WHERE id = ?",
+                                (json.dumps(citations), corr["id"])
+                            )
+                            conn.commit()
+                            cur.close()
+                            conn.close()
+                        except Exception:
+                            pass
+
         for cit in citations:
             # Fix any broken ReportNumber URLs to arn format
             if "url" in cit and "ReportNumber=" in cit["url"]:
@@ -4587,13 +4677,30 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
             old_url = cit.get("url")
             new_url = None
 
+            # Get and clean the citation ID
+            cit_id = str(cit.get("id") or "").strip()
+            if cit_id.lower().startswith("audit "):
+                cit_id = cit_id[6:].strip()
+            elif cit_id.lower().startswith("budget "):
+                cit_id = cit_id[7:].strip()
+            elif cit_id.lower().startswith("school "):
+                cit_id = cit_id[7:].strip()
+            elif cit_id.lower().startswith("grant "):
+                cit_id = cit_id[6:].strip()
+            elif cit_id.lower().startswith("contribution "):
+                cit_id = cit_id[13:].strip()
+            elif cit_id.lower().startswith("bill "):
+                cit_id = cit_id[5:].strip()
+            elif cit_id.lower().startswith("event "):
+                cit_id = cit_id[6:].strip()
+
             # Attempt to extract year from title or id (e.g. 2025)
             year_match = re.search(r'\b(20\d{2})\b', f"{cit.get('title', '')} {cit.get('id', '')}")
             cit_year = int(year_match.group(1)) if year_match else None
 
             source = cit.get("source") or cit.get("type")
             if source == "audit":
-                report_num = str(cit.get("id") or "")
+                report_num = cit_id
                 if not report_num and "url" in cit:
                     match = re.search(r'(?:ReportNumber|arn)=(\d+)', cit["url"], re.IGNORECASE)
                     if match:
@@ -4722,7 +4829,6 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                         new_url = db_source_url
 
             elif source == "council":
-                cit_id = str(cit.get("id") or "")
                 verbatim_text = None
                 meeting_type = None
                 verification_score = None
@@ -4757,7 +4863,6 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                 cit["reviewer_status"] = reviewer_status or "unverified"
 
             elif source == "budget":
-                cit_id = str(cit.get("id") or "")
                 verbatim_text = None
                 db_source_url = None
                 
@@ -4779,38 +4884,80 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                     conn = get_pg_conn()
                     cur = conn.cursor()
                     if cit_id.isdigit():
-                        cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE id = %s", (int(cit_id),))
+                        # Try budget item ID first
+                        cur.execute(
+                            """
+                            SELECT b.jurisdiction_name, b.fiscal_year, b.total_revenue, b.total_expenditures,
+                                   bi.major_category, bi.amount, bi.description, b.source_url
+                            FROM budget_items bi
+                            JOIN budgets b ON bi.budget_id = b.id
+                            WHERE bi.id = %s
+                            """,
+                            (int(cit_id),)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            verbatim_text = f"Budget for {row[0]} ({row[1]}) - {row[4]}: {row[6] or 'Allocation'}. Item Amount: ${row[5]:,}. (Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,})"
+                            db_source_url = row[7]
+                        else:
+                            # Fallback to entire budget ID
+                            cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE id = %s", (int(cit_id),))
+                            row = cur.fetchone()
+                            if row:
+                                verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                                db_source_url = row[4]
                     else:
                         search_val = f"%{clean_search}%"
                         if cit_year:
                             cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE (jurisdiction_name ILIKE %s OR %s ILIKE '%' || jurisdiction_name || '%') AND fiscal_year = %s", (search_val, cit_id, cit_year))
                         else:
                             cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE (jurisdiction_name ILIKE %s OR %s ILIKE '%' || jurisdiction_name || '%')", (search_val, cit_id))
-                    row = cur.fetchone()
+                        row = cur.fetchone()
+                        if row:
+                            verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                            db_source_url = row[4]
                     cur.close()
                     conn.close()
-                    if row:
-                        verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
-                        db_source_url = row[4]
                 except Exception:
                     conn = get_sqlite_conn("municipal_intent.db")
                     if conn:
                         try:
                             cur = conn.cursor()
                             if cit_id.isdigit():
-                                cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE id = ?", (int(cit_id),))
+                                # Try budget item ID first
+                                cur.execute(
+                                    """
+                                    SELECT b.jurisdiction_name, b.fiscal_year, b.total_revenue, b.total_expenditures,
+                                           bi.major_category, bi.amount, bi.description, b.source_url
+                                    FROM budget_items bi
+                                    JOIN budgets b ON bi.budget_id = b.id
+                                    WHERE bi.id = ?
+                                    """,
+                                    (int(cit_id),)
+                                )
+                                row = cur.fetchone()
+                                if row:
+                                    verbatim_text = f"Budget for {row[0]} ({row[1]}) - {row[4]}: {row[6] or 'Allocation'}. Item Amount: ${row[5]:,}. (Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,})"
+                                    db_source_url = row[7]
+                                else:
+                                    # Fallback to entire budget ID
+                                    cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE id = ?", (int(cit_id),))
+                                    row = cur.fetchone()
+                                    if row:
+                                        verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                                        db_source_url = row[4]
                             else:
                                 search_val = f"%{clean_search}%"
                                 if cit_year:
                                     cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE (jurisdiction_name LIKE ? OR ? LIKE '%' || jurisdiction_name || '%') AND fiscal_year = ?", (search_val, cit_id, cit_year))
                                 else:
                                     cur.execute("SELECT jurisdiction_name, fiscal_year, total_revenue, total_expenditures, source_url FROM budgets WHERE (jurisdiction_name LIKE ? OR ? LIKE '%' || jurisdiction_name || '%')", (search_val, cit_id))
-                            row = cur.fetchone()
+                                row = cur.fetchone()
+                                if row:
+                                    verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
+                                    db_source_url = row[4]
                             cur.close()
                             conn.close()
-                            if row:
-                                verbatim_text = f"Budget Record for {row[0]} ({row[1]}): Total Revenue: ${row[2]:,}, Total Expenditures: ${row[3]:,}."
-                                db_source_url = row[4]
                         except Exception:
                             pass
                 cit["verbatim_text_context"] = verbatim_text or f"Budget report details for {cit.get('title') or cit_id}."
@@ -4821,7 +4968,6 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                     new_url = db_source_url
 
             elif source == "grant":
-                cit_id = str(cit.get("id") or "")
                 verbatim_text = None
                 db_source_url = None
                 try:
@@ -4888,7 +5034,6 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                     new_url = db_source_url
 
             elif source == "school":
-                cit_id = str(cit.get("id") or "")
                 verbatim_text = None
                 db_source_url = None
                 
@@ -4958,7 +5103,6 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                     new_url = db_source_url
 
             elif source == "contribution":
-                cit_id = str(cit.get("id") or "")
                 verbatim_text = None
                 try:
                     conn = get_pg_conn()
@@ -4996,7 +5140,7 @@ def enrich_correlations_with_years(correlations_list: list) -> list:
                 cit["reviewer_status"] = "verified"
 
             elif source == "bill":
-                bill_num = str(cit.get("id") or "")
+                bill_num = cit_id
                 if bill_num.startswith("Bill "):
                     bill_num = bill_num[5:]
                 verbatim_text = None
@@ -5289,19 +5433,32 @@ async def dismiss_correlation(corr_id: int, is_admin: bool = Depends(check_admin
 
 @app.post("/api/v1/correlations/{corr_id}/edit")
 async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_admin: bool = Depends(check_admin_access)):
-    """Edit correlation title, hook, and markdown contents."""
+    """Edit correlation title, hook, citations, and markdown contents."""
     try:
         conn = get_pg_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE correlations 
-            SET title = %s, hook = %s, report_markdown = %s 
-            WHERE id = %s 
-            RETURNING id
-            """,
-            (edit_data.title, edit_data.hook, edit_data.report_markdown, corr_id)
-        )
+        citations_json = json.dumps(edit_data.citations) if edit_data.citations is not None else None
+        
+        if citations_json is not None:
+            cur.execute(
+                """
+                UPDATE correlations 
+                SET title = %s, hook = %s, report_markdown = %s, citations = %s 
+                WHERE id = %s 
+                RETURNING id
+                """,
+                (edit_data.title, edit_data.hook, edit_data.report_markdown, citations_json, corr_id)
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE correlations 
+                SET title = %s, hook = %s, report_markdown = %s 
+                WHERE id = %s 
+                RETURNING id
+                """,
+                (edit_data.title, edit_data.hook, edit_data.report_markdown, corr_id)
+            )
         row = cur.fetchone()
         conn.commit()
         cur.close()
@@ -5319,14 +5476,25 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
             if conn:
                 try:
                     cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE correlations 
-                        SET title = ?, hook = ?, report_markdown = ? 
-                        WHERE id = ?
-                        """,
-                        (edit_data.title, edit_data.hook, edit_data.report_markdown, corr_id)
-                    )
+                    citations_json = json.dumps(edit_data.citations) if edit_data.citations is not None else None
+                    if citations_json is not None:
+                        cur.execute(
+                            """
+                            UPDATE correlations 
+                            SET title = ?, hook = ?, report_markdown = ?, citations = ? 
+                            WHERE id = ?
+                            """,
+                            (edit_data.title, edit_data.hook, edit_data.report_markdown, citations_json, corr_id)
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE correlations 
+                            SET title = ?, hook = ?, report_markdown = ? 
+                            WHERE id = ?
+                            """,
+                            (edit_data.title, edit_data.hook, edit_data.report_markdown, corr_id)
+                        )
                     conn.commit()
                     cur.close()
                     conn.close()
