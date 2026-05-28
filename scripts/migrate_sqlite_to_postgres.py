@@ -277,6 +277,63 @@ def migrate_municipal_records(pg_cursor):
 
     conn.close()
 
+def migrate_correlations(pg_cursor):
+    db_path = os.path.join(SQLITE_DIR, "sao_audits.db")
+    if not os.path.exists(db_path):
+        print(f"Skipping correlations: {db_path} not found")
+        return
+        
+    print("Migrating correlations...")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    try:
+        c.execute("SELECT id, title, hook, report_markdown, citations, status, created_at, reviewed_at FROM correlations")
+        rows = c.fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"  Error reading correlations table: {e}")
+        conn.close()
+        return
+        
+    correlations_to_insert = []
+    for r in rows:
+        citations = r[4]
+        try:
+            citations_parsed = json.loads(citations) if citations else []
+            citations_json = json.dumps(citations_parsed)
+        except Exception:
+            citations_json = "[]"
+            
+        correlations_to_insert.append((
+            r[0], # id
+            r[1], # title
+            r[2], # hook
+            r[3], # report_markdown
+            citations_json, # citations
+            r[5], # status
+            r[6], # created_at
+            r[7]  # reviewed_at
+        ))
+        
+    if correlations_to_insert:
+        insert_query = """
+        INSERT INTO correlations (
+            id, title, hook, report_markdown, citations, status, created_at, reviewed_at
+        ) VALUES %s
+        ON CONFLICT (id) DO UPDATE SET
+            title = EXCLUDED.title,
+            hook = EXCLUDED.hook,
+            report_markdown = EXCLUDED.report_markdown,
+            citations = EXCLUDED.citations,
+            status = EXCLUDED.status,
+            created_at = EXCLUDED.created_at,
+            reviewed_at = EXCLUDED.reviewed_at
+        """
+        execute_values(pg_cursor, insert_query, correlations_to_insert)
+        pg_cursor.execute("SELECT setval('correlations_id_seq', COALESCE((SELECT MAX(id)+1 FROM correlations), 1), false);")
+        print(f"  Migrated {len(correlations_to_insert)} correlations.")
+    conn.close()
+
 def main():
     print("Starting SQLite to PostgreSQL Migration...")
     start_time = time.time()
@@ -298,6 +355,9 @@ def main():
         migrate_municipal_records(pg_cursor)
         pg_conn.commit()
         
+        migrate_correlations(pg_cursor)
+        pg_conn.commit()
+        
         print("\n=========================================")
         print("MIGRATION COMPLETE")
         print(f"Time elapsed: {time.time() - start_time:.2f} seconds")
@@ -313,3 +373,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
