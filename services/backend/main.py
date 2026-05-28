@@ -5504,6 +5504,92 @@ async def edit_correlation(corr_id: int, edit_data: CorrelationEditRequest, is_a
                     pass
         raise HTTPException(status_code=500, detail="Failed to edit correlation.")
 
+class CorrelationItem(BaseModel):
+    id: int
+    title: str
+    hook: str
+    report_markdown: str
+    citations: list
+    status: str
+    created_at: Optional[str] = None
+    reviewed_at: Optional[str] = None
+
+class CorrelationSyncRequest(BaseModel):
+    correlations: List[CorrelationItem]
+
+@app.post("/api/v1/correlations/sync")
+async def sync_correlations(req: CorrelationSyncRequest, is_admin: bool = Depends(check_admin_access)):
+    """Receives correlations from local SQLite and inserts/updates them in Postgres/SQLite database."""
+    from psycopg2.extras import execute_values
+    from datetime import datetime
+    try:
+        conn = get_pg_conn()
+        cur = conn.cursor()
+        
+        correlations_to_insert = []
+        for c in req.correlations:
+            citations_json = json.dumps(c.citations)
+            correlations_to_insert.append((
+                c.id, c.title, c.hook, c.report_markdown, citations_json, c.status,
+                c.created_at or datetime.now().isoformat(), c.reviewed_at
+            ))
+            
+        if correlations_to_insert:
+            insert_query = """
+            INSERT INTO correlations (
+                id, title, hook, report_markdown, citations, status, created_at, reviewed_at
+            ) VALUES %s
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                hook = EXCLUDED.hook,
+                report_markdown = EXCLUDED.report_markdown,
+                citations = EXCLUDED.citations,
+                status = EXCLUDED.status,
+                created_at = EXCLUDED.created_at,
+                reviewed_at = EXCLUDED.reviewed_at
+            """
+            execute_values(cur, insert_query, correlations_to_insert)
+            cur.execute("SELECT setval('correlations_id_seq', COALESCE((SELECT MAX(id)+1 FROM correlations), 1), false);")
+            
+        conn.commit()
+        cur.close()
+        conn.close()
+        clear_correlations_cache()
+        return {"status": "success", "message": f"Successfully synchronized {len(req.correlations)} correlations to Postgres."}
+    except Exception as pg_err:
+        # SQLite Fallback if local
+        for db_name in ["sao_audits.db", "sao_2024.db", "municipal_intent.db"]:
+            conn = get_sqlite_conn(db_name)
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    for c in req.correlations:
+                        citations_json = json.dumps(c.citations)
+                        cur.execute(
+                            """
+                            INSERT INTO correlations (
+                                id, title, hook, report_markdown, citations, status, created_at, reviewed_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (id) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                hook = EXCLUDED.hook,
+                                report_markdown = EXCLUDED.report_markdown,
+                                citations = EXCLUDED.citations,
+                                status = EXCLUDED.status,
+                                created_at = EXCLUDED.created_at,
+                                reviewed_at = EXCLUDED.reviewed_at
+                            """,
+                            (c.id, c.title, c.hook, c.report_markdown, citations_json, c.status, c.created_at, c.reviewed_at)
+                        )
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    clear_correlations_cache()
+                    return {"status": "success", "message": f"Successfully synchronized {len(req.correlations)} correlations to SQLite."}
+                except Exception:
+                    pass
+        raise HTTPException(status_code=500, detail=f"Database synchronization failed: {pg_err}")
+
 CORRELATION_GEN_LOCK = asyncio.Lock()
 
 @app.post("/api/v1/correlations/generate")
